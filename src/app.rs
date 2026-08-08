@@ -231,7 +231,11 @@ fn route_phase(nav: &adw::NavigationView, client: &TdClient, phase: auth::Phase)
             )]);
         }
         auth::Phase::Ready => {
-            nav.replace(&[main_page(client)]);
+            // TDLib re-emits Ready after transient reconnects; only build the main
+            // view the first time so we don't wipe the open chat / draft / scroll.
+            if nav.find_page("main").is_none() {
+                nav.replace(&[main_page(client)]);
+            }
         }
         auth::Phase::Closed => {
             nav.replace(&[simple_status_page(
@@ -298,6 +302,7 @@ fn main_page(client: &TdClient) -> adw::NavigationPage {
                 let files = client.files();
                 let cid = client.client_id();
                 let avatar = avatar.clone();
+                let current = current.clone();
                 crate::runtime::spawn(
                     async move {
                         use tdlib_rs::enums::Chat;
@@ -312,7 +317,14 @@ fn main_page(client: &TdClient) -> adw::NavigationPage {
                         }
                         let apply = {
                             let avatar = avatar.clone();
+                            let current = current.clone();
                             move |path: std::path::PathBuf| {
+                                // Discard a late photo for a chat the user already switched away from.
+                                let still_current =
+                                    current.borrow().as_ref().map(|v| v.chat_id()) == Some(chat_id);
+                                if !still_current {
+                                    return;
+                                }
                                 if let Ok(texture) = gtk::gdk::Texture::from_filename(&path) {
                                     avatar.set_custom_image(Some(&texture));
                                 }

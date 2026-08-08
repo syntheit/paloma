@@ -50,6 +50,8 @@ struct Inner {
     index: RefCell<HashMap<i64, ChatObject>>,
     /// Switches between the "loading", "list" and "empty" views.
     stack: gtk::Stack,
+    /// Cancellation handle for the update-subscription task.
+    sub_task: RefCell<Option<glib::JoinHandle<()>>>,
 }
 
 impl ChatList {
@@ -162,9 +164,9 @@ impl ChatList {
                         // row still shows the same chat (guards against reuse).
                         let want_id = item.id();
                         let avatar = avatar.clone();
-                        let item = item.clone();
+                        let li = list_item.clone();
                         bind_files.download(file_id, 16, move |path| {
-                            if item.id() != want_id {
+                            if li.item().and_downcast::<ChatObject>().map(|c| c.id()) != Some(want_id) {
                                 return;
                             }
                             if let Ok(texture) = gtk::gdk::Texture::from_filename(&path) {
@@ -196,10 +198,12 @@ impl ChatList {
         // backing store; the ListView sees the sorted view, the index/store
         // still address rows by insertion for O(1) mutation.
         let sorter = gtk::CustomSorter::new(move |a, b| {
-            let a = a.downcast_ref::<ChatObject>().map(|c| c.order()).unwrap_or(0);
-            let b = b.downcast_ref::<ChatObject>().map(|c| c.order()).unwrap_or(0);
-            // Descending order.
-            b.cmp(&a).into()
+            let a = a.downcast_ref::<ChatObject>();
+            let b = b.downcast_ref::<ChatObject>();
+            let (a_order, a_id) = a.map(|c| (c.order(), c.id())).unwrap_or((0, 0));
+            let (b_order, b_id) = b.map(|c| (c.order(), c.id())).unwrap_or((0, 0));
+            // Descending by order, then stable ascending by id.
+            b_order.cmp(&a_order).then(a_id.cmp(&b_id)).into()
         });
         let sort_model = gtk::SortListModel::new(Some(store.clone()), Some(sorter.clone()));
 
@@ -251,6 +255,7 @@ impl ChatList {
             sorter,
             index: RefCell::new(HashMap::new()),
             stack: stack.clone(),
+            sub_task: RefCell::new(None),
         });
 
         let this = ChatList {
@@ -269,16 +274,25 @@ impl ChatList {
         &self.root
     }
 
+    /// Cancel the update-subscription task (used when the view is torn down).
+    #[allow(dead_code)]
+    pub fn close(&self) {
+        if let Some(h) = self.inner.sub_task.borrow_mut().take() {
+            h.abort();
+        }
+    }
+
     /// Drain the client's update stream on the GTK main thread, dispatching
     /// each update into [`ChatList::handle_update`].
     fn subscribe_updates(&self) {
         let updates = self.inner.client.subscribe();
         let this = self.clone();
-        glib::spawn_future_local(async move {
+        let handle = glib::spawn_future_local(async move {
             while let Ok(update) = updates.recv().await {
                 this.handle_update(update);
             }
         });
+        *self.inner.sub_task.borrow_mut() = Some(handle);
     }
 
     /// Apply a single TDLib update to the store / index.

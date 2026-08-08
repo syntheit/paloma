@@ -10,5 +10,5 @@ Icon=io.matv.Paloma
 Terminal=false
 StartupNotify=true
 DBusActivatable=false
-StartupWMClass=paloma
+StartupWMClass=Paloma
 X-Purism-FormFactor=Workstation;Mobile;

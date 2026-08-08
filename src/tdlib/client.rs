@@ -17,7 +17,10 @@
 //! they are dispatched through [`crate::runtime::spawn`]; see [`TdClient::request`].
 
 use std::cell::RefCell;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use gtk::glib;
@@ -30,6 +33,8 @@ struct Inner {
     subscribers: RefCell<Vec<async_channel::Sender<Update>>>,
     /// Shared file-download cache (avatars + media), created lazily on first use.
     files: RefCell<Option<crate::tdlib::files::FileStore>>,
+    /// Cleared on shutdown to stop the blocking receive pump.
+    running: Arc<AtomicBool>,
 }
 
 /// A cheap, cloneable handle to the running TDLib client.
@@ -51,11 +56,15 @@ impl TdClient {
     pub fn new() -> Self {
         let client_id = tdlib_rs::create_client();
 
+        // Cleared on shutdown to stop the blocking receive pump.
+        let running = Arc::new(AtomicBool::new(true));
+
         let this = TdClient {
             client_id,
             inner: Rc::new(Inner {
                 subscribers: RefCell::new(Vec::new()),
                 files: RefCell::new(None),
+                running: running.clone(),
             }),
         };
 
@@ -65,7 +74,12 @@ impl TdClient {
 
         // The blocking receive loop. A plain OS thread keeps the blocking call
         // off both the GLib executor and the tokio runtime.
+        let pump_running = running.clone();
         std::thread::spawn(move || loop {
+            // Stop when the pump has been signalled to shut down.
+            if !pump_running.load(Ordering::Relaxed) {
+                break;
+            }
             match tdlib_rs::receive() {
                 Some((update, _client_id)) => {
                     // Err means every receiver was dropped (app shutting down).
@@ -82,7 +96,10 @@ impl TdClient {
         let dispatcher = this.clone();
         glib::spawn_future_local(async move {
             while let Ok(update) = raw_rx.recv().await {
-                dispatcher.dispatch(update);
+                let d = dispatcher.clone();
+                if catch_unwind(AssertUnwindSafe(move || d.dispatch(update))).is_err() {
+                    tracing::error!("panic in update dispatch; continuing");
+                }
             }
         });
 
@@ -99,6 +116,12 @@ impl TdClient {
     /// The TDLib client identifier this handle wraps.
     pub fn client_id(&self) -> i32 {
         self.client_id
+    }
+
+    /// Signal the blocking receive pump to stop (used on logout/close).
+    #[allow(dead_code)]
+    pub fn shutdown(&self) {
+        self.inner.running.store(false, Ordering::Relaxed);
     }
 
     /// The shared file-download cache for this session (created on first use).

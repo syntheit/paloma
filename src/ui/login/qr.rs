@@ -84,7 +84,7 @@ pub fn page(client: &crate::tdlib::TdClient) -> adw::NavigationPage {
 
 /// Render `link` (a `tg://` URL) as a QR code SVG into `picture`.
 ///
-/// The SVG is written to a temp file and loaded via `gtk::Picture::set_filename`
+/// The SVG is written to a temp file and loaded via `gtk::Picture::set_file`
 /// (GdkPixbuf's librsvg loader decodes it). `gdk::Texture` cannot decode SVG, so
 /// the file route is the reliable dependency-light path for Wave 1.
 pub fn render_qr(picture: &gtk::Picture, link: &str) {
@@ -103,6 +103,6 @@ pub fn render_qr(picture: &gtk::Picture, link: &str) {
     let mut path = std::env::temp_dir();
     path.push(format!("paloma-qr-{}.svg", std::process::id()));
     if std::fs::write(&path, svg_string.as_bytes()).is_ok() {
-        picture.set_filename(Some(&path));
+        picture.set_file(Some(&gtk::gio::File::for_path(&path)));
     }
 }

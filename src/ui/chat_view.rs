@@ -37,7 +37,7 @@ use gtk::glib;
 use gtk::glib::clone;
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use tdlib_rs::enums::{
@@ -93,6 +93,12 @@ struct Inner {
     reply_bar: gtk::Revealer,
     reply_bar_name: gtk::Label,
     reply_bar_text: gtk::Label,
+    /// The subscription loop task; aborted in `close()` so it drops its
+    /// receiver and the strong `ChatView` it captures (else the view leaks).
+    sub_task: RefCell<Option<glib::JoinHandle<()>>>,
+    /// Temporary (pending) message ids awaiting `MessageSendSucceeded`/`Failed`,
+    /// used to dedup the `NewMessage` TDLib echoes for our own outgoing sends.
+    temp_ids: RefCell<HashSet<i64>>,
 }
 
 impl ChatView {
@@ -239,6 +245,8 @@ impl ChatView {
             reply_bar,
             reply_bar_name,
             reply_bar_text,
+            sub_task: RefCell::new(None),
+            temp_ids: RefCell::new(HashSet::new()),
         });
 
         let this = ChatView {
@@ -293,17 +301,26 @@ impl ChatView {
 
         let updates = self.inner.client.subscribe();
         let this = self.clone();
-        glib::spawn_future_local(async move {
+        let handle = glib::spawn_future_local(async move {
             while let Ok(update) = updates.recv().await {
                 this.handle_update(update);
             }
         });
+        // Keep the handle so `close()` can abort the loop; aborting drops the
+        // future, its captured strong `ChatView`, and the `updates` receiver.
+        *self.inner.sub_task.borrow_mut() = Some(handle);
 
         self.load_initial_history();
     }
 
     /// Stop streaming for this chat. Call when the view is popped/replaced.
     pub fn close(&self) {
+        // Abort the update loop so it drops its receiver and the strong
+        // `ChatView` it holds — otherwise this view leaks on every chat switch.
+        if let Some(handle) = self.inner.sub_task.borrow_mut().take() {
+            handle.abort();
+        }
+
         let cid = self.inner.client.client_id();
         let chat_id = self.inner.chat_id;
         crate::runtime::spawn(
@@ -323,12 +340,30 @@ impl ChatView {
         let this = self.clone();
         crate::runtime::spawn(
             async move {
-                let _ = functions::get_chat_history(chat_id, 0, 0, 50, false, cid).await;
-                functions::get_chat_history(chat_id, 0, 0, 50, false, cid).await
+                // The first call primes TDLib's cache and is often empty on a
+                // cold chat; the second is usually the real batch. Return both
+                // so the callback can pick whichever actually has messages.
+                let first = functions::get_chat_history(chat_id, 0, 0, 50, false, cid).await;
+                let second = functions::get_chat_history(chat_id, 0, 0, 50, false, cid).await;
+                (first, second)
             },
-            move |res| {
-                if let Ok(Messages::Messages(msgs)) = res {
-                    this.ingest_history(msgs.messages, true);
+            move |(first, second)| {
+                // Choose the non-empty batch; prefer the second (fresher) when
+                // it has content, falling back to the first otherwise.
+                let pick = |r: &Result<Messages, tdlib_rs::types::Error>| -> Option<Vec<Option<tdlib_rs::types::Message>>> {
+                    if let Ok(Messages::Messages(m)) = r {
+                        if !m.messages.is_empty() {
+                            return Some(m.messages.clone());
+                        }
+                    }
+                    None
+                };
+                if let Some(msgs) = pick(&second).or_else(|| pick(&first)) {
+                    this.ingest_history(msgs, true);
+                } else {
+                    // Both empty: still ingest empty as initial (won't set
+                    // reached_top now, so older paging stays available).
+                    this.ingest_history(Vec::new(), true);
                 }
             },
         );
@@ -350,10 +385,22 @@ impl ChatView {
         let this = self.clone();
         crate::runtime::spawn(
             async move { functions::get_chat_history(chat_id, from, 0, 50, false, cid).await },
-            move |res| {
-                this.inner.loading_older.set(false);
-                if let Ok(Messages::Messages(msgs)) = res {
+            move |res| match res {
+                Ok(Messages::Messages(msgs)) if !msgs.messages.is_empty() => {
+                    // Non-empty: ingest; the scroll-restore idle in
+                    // `ingest_history` clears `loading_older` once it runs, so
+                    // the programmatic set_value can't re-trigger this loop.
                     this.ingest_history(msgs.messages, false);
+                }
+                Ok(Messages::Messages(_)) => {
+                    // Empty older batch: reached top; clear the guard here since
+                    // no restore idle runs on the empty path.
+                    this.ingest_history(Vec::new(), false); // sets reached_top
+                    this.inner.loading_older.set(false);
+                }
+                Err(e) => {
+                    tracing::warn!(code = e.code, msg = %e.message, "get_chat_history (older) failed");
+                    this.inner.loading_older.set(false);
                 }
             },
         );
@@ -364,7 +411,11 @@ impl ChatView {
     fn ingest_history(&self, messages: Vec<Option<tdlib_rs::types::Message>>, is_initial: bool) {
         let batch: Vec<tdlib_rs::types::Message> = messages.into_iter().flatten().collect();
         if batch.is_empty() {
-            self.inner.reached_top.set(true);
+            // Only an empty *older* batch means we've hit the top. An empty
+            // initial batch (e.g. a cold priming call) must not disable paging.
+            if !is_initial {
+                self.inner.reached_top.set(true);
+            }
             return;
         }
 
@@ -397,19 +448,32 @@ impl ChatView {
 
         self.resolve_names(to_resolve);
         self.resolve_replies(&inserted);
-        // Grouping flags depend on neighbours; re-bind the whole loaded run.
-        self.rebind_all();
 
         if is_initial {
+            // Grouping flags depend on neighbours; re-bind the whole loaded run.
+            self.rebind_all();
             self.scroll_to_bottom();
             self.mark_visible_read(&ordered);
         } else {
+            // A prepend inserts a contiguous run at the top (positions
+            // 0..inserted.len()). Re-bind only that run plus the one boundary
+            // row below it — a full invalidate here fights scroll-restore.
+            let count = (inserted.len() as u32)
+                .saturating_add(1)
+                .min(self.inner.store.n_items());
+            if count > 0 {
+                self.inner.store.items_changed(0, count, count);
+            }
             let scroller = self.inner.scroller.clone();
+            let inner = self.inner.clone();
             glib::idle_add_local_once(move || {
                 let vadj = scroller.vadjustment();
                 let new_upper = vadj.upper();
                 let delta = new_upper - old_upper;
                 vadj.set_value(old_value + delta);
+                // Clear the load-older guard only after the anchor is restored,
+                // so the programmatic set_value above can't re-trigger paging.
+                inner.loading_older.set(false);
             });
         }
     }
@@ -443,7 +507,11 @@ impl ChatView {
         match update {
             Update::NewMessage(u) if u.message.chat_id == self.inner.chat_id => {
                 let id = u.message.id;
-                if self.inner.index.borrow().contains_key(&id) {
+                // TDLib also echoes our own outgoing sends as NewMessage; skip
+                // ids we already hold or are tracking as optimistic temps.
+                if self.inner.index.borrow().contains_key(&id)
+                    || self.inner.temp_ids.borrow().contains(&id)
+                {
                     if let Some(obj) = self.inner.index.borrow().get(&id).cloned() {
                         obj.update_from_message(&u.message);
                         self.notify_changed(id);
@@ -453,12 +521,13 @@ impl ChatView {
                 let obj = MessageObject::from_message(&u.message);
                 let mut to_resolve = Vec::new();
                 self.apply_sender_name(&obj, &u.message.sender_id, &mut to_resolve);
-                self.insert_sorted(&obj);
+                let pos = self.insert_sorted(&obj);
                 self.inner.index.borrow_mut().insert(id, obj);
                 self.resolve_names(to_resolve);
                 self.resolve_replies(&[id]);
-                // A new tail message may end the previous run's grouping.
-                self.rebind_tail();
+                // The insert may end the previous run's grouping; rebind the
+                // affected window around the insertion point.
+                self.rebind_around(pos);
                 self.scroll_to_bottom();
                 if !u.message.is_outgoing {
                     self.view_message(id);
@@ -467,16 +536,35 @@ impl ChatView {
             Update::MessageSendSucceeded(u) if u.message.chat_id == self.inner.chat_id => {
                 let old = u.old_message_id;
                 let new_id = u.message.id;
+                self.inner.temp_ids.borrow_mut().remove(&old);
                 let existing = self.inner.index.borrow_mut().remove(&old);
                 if let Some(obj) = existing {
+                    // Drop the stale store slot (keyed at the temp id) BEFORE we
+                    // mutate the object's id, then re-insert to keep the store's
+                    // binary-search order intact under the real id.
+                    self.remove_from_store_by_id(old);
                     obj.update_from_message(&u.message);
+                    let pos = self.insert_sorted(&obj);
                     self.inner.index.borrow_mut().insert(new_id, obj);
-                    self.notify_changed(new_id);
+                    self.rebind_around(pos);
                 } else if !self.inner.index.borrow().contains_key(&new_id) {
                     let obj = MessageObject::from_message(&u.message);
-                    self.insert_sorted(&obj);
+                    let pos = self.insert_sorted(&obj);
                     self.inner.index.borrow_mut().insert(new_id, obj);
+                    self.rebind_around(pos);
                 }
+            }
+            Update::MessageSendFailed(u) if u.message.chat_id == self.inner.chat_id => {
+                let old = u.old_message_id;
+                self.inner.temp_ids.borrow_mut().remove(&old);
+                if let Some(obj) = self.inner.index.borrow().get(&old).cloned() {
+                    // Keep the row so the user sees it stuck-failed rather than
+                    // vanishing; mark it pending/failed for styling.
+                    obj.update_from_message(&u.message);
+                    obj.set_is_pending(true);
+                    self.notify_changed(old);
+                }
+                tracing::warn!(code = u.error.code, msg = %u.error.message, "message send failed");
             }
             Update::MessageContent(u) if u.chat_id == self.inner.chat_id => {
                 if let Some(obj) = self.inner.index.borrow().get(&u.message_id).cloned() {
@@ -536,14 +624,33 @@ impl ChatView {
         }
     }
 
-    /// Re-bind the last two rows (a new tail can flip the prior row's avatar).
-    fn rebind_tail(&self) {
+    /// Re-bind the inserted row and its immediate neighbours so grouping/sender/
+    /// avatar flags recompute for the affected window `[pos-1, pos+1]`.
+    fn rebind_around(&self, pos: u32) {
         let n = self.inner.store.n_items();
         if n == 0 {
             return;
         }
-        let start = n.saturating_sub(2);
-        self.inner.store.items_changed(start, n - start, n - start);
+        let start = pos.saturating_sub(1);
+        let end = (pos + 1).min(n.saturating_sub(1));
+        let count = end - start + 1;
+        self.inner.store.items_changed(start, count, count);
+    }
+
+    /// Remove the first store row whose id matches `id` (index-map untouched).
+    /// Callers that already removed the object from `index` use this to drop the
+    /// stale store slot before re-inserting under a new id.
+    fn remove_from_store_by_id(&self, id: i64) {
+        let store = &self.inner.store;
+        let n = store.n_items();
+        for pos in 0..n {
+            if let Some(obj) = store.item(pos).and_downcast::<MessageObject>() {
+                if obj.id() == id {
+                    store.remove(pos);
+                    return;
+                }
+            }
+        }
     }
 
     /// Fill in `sender_name` for an incoming message; queue unknown user ids.
@@ -796,12 +903,17 @@ impl ChatView {
             },
             move |res| match res {
                 Ok(MessageEnum::Message(msg)) => {
+                    // The returned message already carries a temporary id and a
+                    // Pending sending_state, so this IS the single optimistic
+                    // insert; `from_message` sets is_pending() from that state.
                     let id = msg.id;
                     if !this.inner.index.borrow().contains_key(&id) {
                         let obj = MessageObject::from_message(&msg);
-                        this.insert_sorted(&obj);
+                        this.inner.temp_ids.borrow_mut().insert(id);
+                        let pos = this.insert_sorted(&obj);
                         this.inner.index.borrow_mut().insert(id, obj);
                         this.resolve_replies(&[id]);
+                        this.rebind_around(pos);
                         this.scroll_to_bottom();
                     }
                 }
@@ -1254,6 +1366,9 @@ fn bind_row(list_item: &glib::Object, store: &gio::ListStore, files: &FileStore)
     if let Some(avatar) = find::<adw::Avatar>(&root, "avatar") {
         if outgoing {
             avatar.set_visible(false);
+            // Drop any previous incoming sender's photo so a recycled outgoing
+            // row can't flash a stale avatar.
+            avatar.set_custom_image(gtk::gdk::Paintable::NONE);
         } else {
             avatar.set_visible(true);
             // Keep the column width stable inside a run by reserving the slot:
@@ -1273,9 +1388,13 @@ fn bind_row(list_item: &glib::Object, store: &gio::ListStore, files: &FileStore)
                     } else {
                         let want = item.id();
                         let avatar2 = avatar.clone();
-                        let item2 = item.clone();
+                        let li = list_item.clone();
                         files.download(file_id, 12, move |path| {
-                            if item2.id() != want {
+                            // The row may have been recycled onto another item
+                            // by the time this download lands; bail if so.
+                            if li.item().and_downcast::<MessageObject>().map(|m| m.id())
+                                != Some(want)
+                            {
                                 return;
                             }
                             if let Ok(texture) = gtk::gdk::Texture::from_filename(&path) {
@@ -1332,9 +1451,11 @@ fn bind_row(list_item: &glib::Object, store: &gio::ListStore, files: &FileStore)
             } else {
                 let want = item.id();
                 let picture2 = picture.clone();
-                let item2 = item.clone();
+                let li = list_item.clone();
                 files.download(file_id, 8, move |path| {
-                    if item2.id() != want {
+                    // Guard against recycling: only paint if this row still
+                    // holds the item we started the download for.
+                    if li.item().and_downcast::<MessageObject>().map(|m| m.id()) != Some(want) {
                         return;
                     }
                     if let Ok(texture) = gtk::gdk::Texture::from_filename(&path) {
@@ -1345,6 +1466,8 @@ fn bind_row(list_item: &glib::Object, store: &gio::ListStore, files: &FileStore)
         } else {
             picture.set_visible(false);
             picture.set_paintable(gtk::gdk::Paintable::NONE);
+            picture.set_size_request(-1, -1);
+            picture.set_widget_name("photo");
         }
     }
 

@@ -80,8 +80,15 @@ pub fn load_credentials() -> Result<Credentials, ConfigError> {
     }
 
     let contents = std::fs::read_to_string(&path)?;
-    let raw: RawCreds =
-        toml::from_str(&contents).map_err(|e| ConfigError::Parse(e.to_string()))?;
+    let raw: RawCreds = toml::from_str(&contents).map_err(|e| {
+        let mut msg = e.to_string();
+        // A quoted api_id (`api_id = "123"`) is the most common mistake and TOML's
+        // own error is cryptic, so prepend a targeted hint.
+        if contents.contains("api_id = \"") || contents.contains("api_id=\"") {
+            msg = format!("api_id must be a bare integer, not quoted. {msg}");
+        }
+        ConfigError::Parse(msg)
+    })?;
 
     // Validate the parsed values.
     if raw.api_id == 0 {

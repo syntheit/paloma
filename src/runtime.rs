@@ -1,13 +1,13 @@
 //! Async bridge between the shared tokio runtime and the GLib main loop.
 //!
-//! reqwest (and therefore `linkding-rs` and `oo7`) needs a tokio reactor in the
-//! polling thread. The GLib executor has none, so we run network/keyring futures
-//! on a dedicated multi-thread tokio runtime and marshal only the *result* back
-//! to the GTK thread, where `!Send` widget updates are legal.
+//! TDLib's async request futures (`tdlib_rs::functions::*`) need a tokio reactor
+//! to make progress, but the GLib main-loop executor has none. We run those
+//! futures on a dedicated multi-thread tokio runtime and marshal only the
+//! *result* back to the GTK main thread, where `!Send` widget updates are legal.
 //!
 //! Usage:
 //! ```ignore
-//! spawn(async { client.list_bookmarks(args).await }, move |res| {
+//! spawn(async move { tdlib_rs::functions::get_me(cid).await }, move |res| {
 //!     // runs on the GTK main thread
 //!     match res { Ok(_) => (), Err(_) => () }
 //! });

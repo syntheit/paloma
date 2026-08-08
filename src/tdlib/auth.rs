@@ -56,7 +56,7 @@ pub fn start(client: &TdClient, creds: Credentials) -> async_channel::Receiver<P
                 AuthorizationState::WaitTdlibParameters => {
                     // TDLib is asking for its startup parameters; supply them and
                     // report that we're still connecting.
-                    send_tdlib_parameters(&client, &creds);
+                    send_tdlib_parameters(&client, &creds, phase_tx.clone());
                     Phase::Connecting
                 }
                 AuthorizationState::WaitPhoneNumber => Phase::WaitPhone,
@@ -90,7 +90,11 @@ pub fn start(client: &TdClient, creds: Credentials) -> async_channel::Receiver<P
 ///
 /// All owned strings are computed up front and moved into the `Send` future so
 /// nothing `!Send` crosses into the tokio runtime.
-fn send_tdlib_parameters(client: &TdClient, creds: &Credentials) {
+fn send_tdlib_parameters(
+    client: &TdClient,
+    creds: &Credentials,
+    phase_tx: async_channel::Sender<Phase>,
+) {
     let db_dir = crate::config::td_database_dir()
         .to_string_lossy()
         .into_owned();
@@ -120,9 +124,16 @@ fn send_tdlib_parameters(client: &TdClient, creds: &Credentials) {
         .await
     };
 
-    client.request(fut, |res| {
+    let tx = phase_tx.clone();
+    client.request(fut, move |res| {
         if let Err(e) = res {
             tracing::error!(code = e.code, msg = %e.message, "set_tdlib_parameters failed");
+            let tx = tx.clone();
+            // Deliver an error phase to the UI so the spinner doesn't hang forever.
+            // `send` is async, so marshal it back through the GLib main loop.
+            glib::spawn_future_local(async move {
+                let _ = tx.send(Phase::Error(e.message)).await;
+            });
         }
     });
 }

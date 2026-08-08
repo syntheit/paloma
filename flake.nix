@@ -50,6 +50,7 @@
           pango
           cairo
           gdk-pixbuf
+          librsvg # SVG pixbuf loader for the QR-code login page
           graphene
           harfbuzz
           # TDLib backend (via tdlib-rs with the `pkg-config` feature): tdjson.pc
