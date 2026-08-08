@@ -26,6 +26,17 @@
       let
         pkgs = import nixpkgs { inherit system; };
 
+        # Optional build-time API credentials. Export PALOMA_API_ID and
+        # PALOMA_API_HASH before running `nix build --impure` to bake them into
+        # the wrapper so the app boots straight to the phone-login screen.
+        # When absent (pure builds / CI) the build succeeds and the app falls
+        # back to ~/.config/paloma/credentials.toml at runtime.
+        # See secrets.nix.example for the full workflow.
+        apiCreds = {
+          apiId = builtins.getEnv "PALOMA_API_ID";
+          apiHash = builtins.getEnv "PALOMA_API_HASH";
+        };
+
         # Pinned stable Rust toolchain via fenix (reproducible, works on aarch64 too).
         rustToolchain = fenix.packages.${system}.stable.toolchain;
 
@@ -119,11 +130,21 @@
             # crane doesn't stamp the GUI libraries into the binary's RPATH, so
             # the wrapped app can't find libadwaita/gtk4/glib at runtime outside a
             # full GNOME session. Put them on the wrapper's LD_LIBRARY_PATH.
-            preFixup = ''
-              gappsWrapperArgs+=(
-                --prefix LD_LIBRARY_PATH : "${pkgs.lib.makeLibraryPath buildInputs}"
-              )
-            '';
+            #
+            # If secrets.nix supplies non-empty API credentials, bake them into
+            # the wrapper environment so the app boots straight to phone-login
+            # without any per-user credentials.toml setup.
+            preFixup =
+              let
+                hasApiCreds = apiCreds.apiId != "" && apiCreds.apiHash != "";
+              in
+              ''
+                gappsWrapperArgs+=(
+                  --prefix LD_LIBRARY_PATH : "${pkgs.lib.makeLibraryPath buildInputs}"
+                  ${pkgs.lib.optionalString hasApiCreds ''--set PALOMA_API_ID "${apiCreds.apiId}"''}
+                  ${pkgs.lib.optionalString hasApiCreds ''--set PALOMA_API_HASH "${apiCreds.apiHash}"''}
+                )
+              '';
 
             meta = with pkgs.lib; {
               description = "Native GTK4/libadwaita Telegram client";

@@ -79,17 +79,27 @@ async fn clone_loop(
 }
 
 /// Static page shown when no API credentials are configured. Needs no client.
+///
+/// This should only appear in developer / source builds where no credentials
+/// were baked in via the Nix package. Nix-installed Paloma bakes the
+/// api_id / api_hash into the wrapper at build time so end-users never see
+/// this page.
 fn credentials_page(app: &adw::Application) -> adw::NavigationPage {
     let path = config::credentials_path();
     let description = format!(
-        "Paloma needs a Telegram API ID and hash.\n\n\
-         1. Visit my.telegram.org and log in.\n\
-         2. Open “API development tools” and create an app.\n\
-         3. Copy the api_id and api_hash into:\n\
-         {}\n\n\
-         as:\n\
-         api_id = 123456\n\
-         api_hash = \"your-hash-here\"\n\n\
+        "This is a one-time developer setup step.\n\n\
+         Paloma needs a Telegram API ID and hash to connect. \
+         Production builds have these baked in -- if you are seeing this \
+         page you are running a source build without secrets.\n\n\
+         To fix it, either:\n\n\
+         Option A -- Nix build (recommended):\n\
+         Copy secrets.nix.example to secrets.nix in the repo root, \
+         fill in your api_id and api_hash, then rebuild.\n\n\
+         Option B -- runtime file:\n\
+         Create {} with:\n\
+           api_id = 123456\n\
+           api_hash = \"your-hash-here\"\n\n\
+         Get your credentials at my.telegram.org > API development tools.\n\n\
          Then restart Paloma.",
         path.display()
     );
