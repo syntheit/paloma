@@ -425,20 +425,34 @@ impl ChatList {
     }
 
     /// Insert `chat` if new, otherwise refresh the existing live object in place.
+    ///
+    /// When the chat arrives with no `last_message` (common at load time — TDLib
+    /// fills it later via `updateChatLastMessage`, whose initial burst this view
+    /// can miss), the derived preview is empty. In that case we fetch the chat's
+    /// most recent message directly and set the preview, so preview-less rows
+    /// don't stay blank forever.
     fn add_or_update(&self, chat: tdlib_rs::types::Chat) {
         let id = chat.id;
+        let preview = chat
+            .last_message
+            .as_ref()
+            .map(crate::models::chat_object::message_preview)
+            .unwrap_or_default();
+
+        tracing::debug!(
+            title = %chat.title,
+            has_last_message = chat.last_message.is_some(),
+            preview_len = preview.len(),
+            "add_or_update"
+        );
+
         let existing = self.inner.index.borrow().get(&id).cloned();
         if let Some(obj) = existing {
             obj.set_title(chat.title.as_str());
             obj.set_unread_count(chat.unread_count);
             obj.set_order(Self::main_order(&chat.positions));
-            let preview = chat
-                .last_message
-                .as_ref()
-                .map(crate::models::chat_object::message_preview)
-                .unwrap_or_default();
             if !preview.is_empty() {
-                obj.set_last_message(preview);
+                obj.set_last_message(preview.clone());
             }
             obj.set_photo_file_id(chat.photo.as_ref().map(|p| p.small.id).unwrap_or(0));
             self.notify_changed(id);
@@ -449,6 +463,42 @@ impl ChatList {
         }
         self.update_visibility();
         self.resort();
+
+        // The chat came in without a usable preview: fetch its latest message
+        // directly. One `from_message_id=0, limit=1` call on a warm DB returns
+        // the latest message; `only_local=false` lets a cold cache hit the
+        // server. If the list comes back empty, the later `updateChatLastMessage`
+        // will fill it — we don't loop or prime here.
+        if preview.is_empty() {
+            self.fetch_last_message(id);
+        }
+    }
+
+    /// Fetch the most recent message for `chat_id` and, if found, set it as the
+    /// chat's preview. Keyed by `chat_id` through the index, so it's safe against
+    /// row recycling. Only called for chats that arrived without a preview.
+    fn fetch_last_message(&self, chat_id: i64) {
+        let cid = self.inner.client.client_id();
+        let this = self.clone();
+        crate::runtime::spawn(
+            async move {
+                use tdlib_rs::enums::Messages;
+                match tdlib_rs::functions::get_chat_history(chat_id, 0, 0, 1, false, cid).await {
+                    Ok(Messages::Messages(m)) => m.messages.into_iter().flatten().next(),
+                    Err(_) => None,
+                }
+            },
+            move |res| {
+                if let Some(msg) = res {
+                    if let Some(obj) = this.inner.index.borrow().get(&chat_id) {
+                        obj.set_last_message(crate::models::chat_object::message_preview(&msg));
+                    } else {
+                        return;
+                    }
+                    this.notify_changed(chat_id);
+                }
+            },
+        );
     }
 
     /// Force the factory to re-bind the row for `chat_id`, reflecting mutations
