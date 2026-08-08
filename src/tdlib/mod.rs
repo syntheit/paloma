@@ -8,5 +8,7 @@
 
 pub mod auth;
 pub mod client;
+pub mod files;
 
 pub use client::TdClient;
+pub use files::FileStore;

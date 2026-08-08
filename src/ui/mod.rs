@@ -73,6 +73,52 @@ const APP_CSS: &str = "
     background-color: alpha(@card_fg_color, 0.08);
     padding: 2px 4px;
 }
+
+/* --- Photo messages --- */
+.msg-photo {
+    border-radius: 12px;
+    margin: 1px 0;
+}
+
+/* --- Reply quoted header inside a bubble --- */
+.msg-reply {
+    border-left: 3px solid @accent_bg_color;
+    padding: 1px 6px;
+    margin-bottom: 2px;
+    border-radius: 4px;
+    background-color: alpha(@accent_bg_color, 0.12);
+}
+.msg-out .msg-reply {
+    border-left-color: @accent_fg_color;
+    background-color: alpha(@accent_fg_color, 0.15);
+}
+.msg-reply-name {
+    font-size: 0.78em;
+    font-weight: bold;
+}
+.msg-reply-text {
+    font-size: 0.78em;
+    opacity: 0.85;
+}
+
+/* --- Compose reply strip (above the entry) --- */
+.reply-bar {
+    border-left: 3px solid @accent_bg_color;
+    padding-left: 8px;
+}
+.reply-bar-name {
+    font-size: 0.85em;
+    font-weight: bold;
+    color: @accent_bg_color;
+}
+.reply-bar-text {
+    font-size: 0.85em;
+}
+
+/* --- Full-image viewer dialog --- */
+.image-viewer {
+    background-color: @window_bg_color;
+}
 ";
 
 /// Install the app stylesheet. Call once at application startup.

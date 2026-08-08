@@ -62,6 +62,7 @@ impl ChatList {
         on_activate: impl Fn(i64, String) + 'static,
     ) -> Self {
         let store = gio::ListStore::new::<ChatObject>();
+        let files = client.files();
 
         // --- Row factory: builds & recycles one widget per visible slot. -----
         let factory = gtk::SignalListItemFactory::new();
@@ -123,7 +124,8 @@ impl ChatList {
             list_item.set_child(Some(&hbox));
         });
 
-        factory.connect_bind(|_, list_item| {
+        let bind_files = files.clone();
+        factory.connect_bind(move |_, list_item| {
             let list_item = list_item
                 .downcast_ref::<gtk::ListItem>()
                 .expect("list item is a ListItem");
@@ -143,7 +145,34 @@ impl ChatList {
             // the update pump calls `notify_changed`, which re-runs this bind
             // for the affected slot. This keeps binding lifetimes trivial.
             if let Some(avatar) = find::<adw::Avatar>(&root, "avatar") {
+                // Default: initials from the title, no custom image.
                 avatar.set_text(Some(&item.title()));
+                avatar.set_show_initials(true);
+                avatar.set_custom_image(gtk::gdk::Paintable::NONE);
+
+                let file_id = item.photo_file_id();
+                if file_id != 0 {
+                    if let Some(path) = bind_files.cached(file_id) {
+                        // Cache hit: apply immediately.
+                        if let Ok(texture) = gtk::gdk::Texture::from_filename(&path) {
+                            avatar.set_custom_image(Some(&texture));
+                        }
+                    } else {
+                        // Miss: download, then apply — but only if this recycled
+                        // row still shows the same chat (guards against reuse).
+                        let want_id = item.id();
+                        let avatar = avatar.clone();
+                        let item = item.clone();
+                        bind_files.download(file_id, 16, move |path| {
+                            if item.id() != want_id {
+                                return;
+                            }
+                            if let Ok(texture) = gtk::gdk::Texture::from_filename(&path) {
+                                avatar.set_custom_image(Some(&texture));
+                            }
+                        });
+                    }
+                }
             }
             if let Some(title) = find::<gtk::Label>(&root, "title") {
                 title.set_text(&item.title());
@@ -303,6 +332,12 @@ impl ChatList {
                 }
                 self.notify_changed(u.chat_id);
             }
+            Update::ChatPhoto(u) => {
+                if let Some(obj) = self.inner.index.borrow().get(&u.chat_id) {
+                    obj.set_photo_file_id(u.photo.as_ref().map(|p| p.small.id).unwrap_or(0));
+                }
+                self.notify_changed(u.chat_id);
+            }
             Update::ChatReadInbox(u) => {
                 if let Some(obj) = self.inner.index.borrow().get(&u.chat_id) {
                     obj.set_unread_count(u.unread_count);
@@ -389,6 +424,7 @@ impl ChatList {
                     .map(crate::models::chat_object::message_preview)
                     .unwrap_or_default(),
             );
+            obj.set_photo_file_id(chat.photo.as_ref().map(|p| p.small.id).unwrap_or(0));
             self.notify_changed(id);
         } else {
             let obj = ChatObject::from_chat(&chat);

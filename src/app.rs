@@ -288,6 +288,45 @@ fn main_page(client: &TdClient) -> adw::NavigationPage {
 
             let view = ChatView::new(client.clone(), chat_id);
             let header = adw::HeaderBar::new();
+
+            // Chat avatar at the start of the header: initials now, photo once
+            // downloaded. Fetched via get_chat since the row only handed us the
+            // id + title.
+            let avatar = adw::Avatar::new(28, Some(&title), true);
+            header.pack_start(&avatar);
+            {
+                let files = client.files();
+                let cid = client.client_id();
+                let avatar = avatar.clone();
+                crate::runtime::spawn(
+                    async move {
+                        use tdlib_rs::enums::Chat;
+                        match tdlib_rs::functions::get_chat(chat_id, cid).await {
+                            Ok(Chat::Chat(c)) => c.photo.as_ref().map(|p| p.small.id).unwrap_or(0),
+                            Err(_) => 0,
+                        }
+                    },
+                    move |file_id| {
+                        if file_id == 0 {
+                            return;
+                        }
+                        let apply = {
+                            let avatar = avatar.clone();
+                            move |path: std::path::PathBuf| {
+                                if let Ok(texture) = gtk::gdk::Texture::from_filename(&path) {
+                                    avatar.set_custom_image(Some(&texture));
+                                }
+                            }
+                        };
+                        if let Some(path) = files.cached(file_id) {
+                            apply(path);
+                        } else {
+                            files.download(file_id, 16, apply);
+                        }
+                    },
+                );
+            }
+
             let toolbar = adw::ToolbarView::builder().content(view.widget()).build();
             toolbar.add_top_bar(&header);
             let page = adw::NavigationPage::builder()

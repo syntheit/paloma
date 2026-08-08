@@ -28,6 +28,8 @@ use tdlib_rs::enums::Update;
 struct Inner {
     /// Live update subscribers. Closed senders are pruned lazily on dispatch.
     subscribers: RefCell<Vec<async_channel::Sender<Update>>>,
+    /// Shared file-download cache (avatars + media), created lazily on first use.
+    files: RefCell<Option<crate::tdlib::files::FileStore>>,
 }
 
 /// A cheap, cloneable handle to the running TDLib client.
@@ -53,6 +55,7 @@ impl TdClient {
             client_id,
             inner: Rc::new(Inner {
                 subscribers: RefCell::new(Vec::new()),
+                files: RefCell::new(None),
             }),
         };
 
@@ -96,6 +99,18 @@ impl TdClient {
     /// The TDLib client identifier this handle wraps.
     pub fn client_id(&self) -> i32 {
         self.client_id
+    }
+
+    /// The shared file-download cache for this session (created on first use).
+    ///
+    /// Every caller gets the *same* [`crate::tdlib::files::FileStore`], so a
+    /// path resolved for one widget is instantly visible to all the others.
+    pub fn files(&self) -> crate::tdlib::files::FileStore {
+        self.inner
+            .files
+            .borrow_mut()
+            .get_or_insert_with(|| crate::tdlib::files::FileStore::new(self.client_id))
+            .clone()
     }
 
     /// Forward one update to every live subscriber, pruning closed channels.

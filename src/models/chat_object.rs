@@ -28,6 +28,10 @@ mod imp {
         pub unread_count: Cell<i32>,
         #[property(get, set)]
         pub order: Cell<i64>,
+        /// Small chat-photo `file_id` for the avatar, or 0 if the chat has no
+        /// photo (the row then shows initials).
+        #[property(get, set, name = "photo-file-id")]
+        pub photo_file_id: Cell<i32>,
     }
 
     #[glib::object_subclass]
@@ -65,6 +69,7 @@ impl ChatObject {
                 .map(message_preview)
                 .unwrap_or_default(),
         );
+        obj.set_photo_file_id(photo_file_id_of(chat));
         obj
     }
 }
@@ -76,6 +81,11 @@ fn main_list_order(positions: &[types::ChatPosition]) -> i64 {
         .find(|p| matches!(p.list, ChatList::Main))
         .map(|p| p.order)
         .unwrap_or(0)
+}
+
+/// The small chat-photo `file_id` for a chat's avatar, or 0 if it has none.
+fn photo_file_id_of(chat: &types::Chat) -> i32 {
+    chat.photo.as_ref().map(|p| p.small.id).unwrap_or(0)
 }
 
 /// Render a short, single-line preview of a message for the chat list.
