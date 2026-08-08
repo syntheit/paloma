@@ -333,38 +333,59 @@ impl ChatView {
         );
     }
 
-    /// Load the most recent ~50 messages (priming call then a real batch).
+    /// Load the most recent history. TDLib returns only ~1 message for a
+    /// cold-cache `from_message_id=0` request, so — like tgt — we prime once
+    /// then loop, paging from the running oldest id, until we've accumulated a
+    /// real backlog (or a batch comes back empty). The whole accumulation is
+    /// then ingested as the single initial batch (newest at the bottom).
     fn load_initial_history(&self) {
+        // Target size of the initial backlog to show on open.
+        const TARGET: usize = 40;
+        // Per-request batch size.
+        const BATCH: i32 = 50;
+
         let cid = self.inner.client.client_id();
         let chat_id = self.inner.chat_id;
         let this = self.clone();
         crate::runtime::spawn(
             async move {
-                // The first call primes TDLib's cache and is often empty on a
-                // cold chat; the second is usually the real batch. Return both
-                // so the callback can pick whichever actually has messages.
-                let first = functions::get_chat_history(chat_id, 0, 0, 50, false, cid).await;
-                let second = functions::get_chat_history(chat_id, 0, 0, 50, false, cid).await;
-                (first, second)
-            },
-            move |(first, second)| {
-                // Choose the non-empty batch; prefer the second (fresher) when
-                // it has content, falling back to the first otherwise.
-                let pick = |r: &Result<Messages, tdlib_rs::types::Error>| -> Option<Vec<Option<tdlib_rs::types::Message>>> {
-                    if let Ok(Messages::Messages(m)) = r {
-                        if !m.messages.is_empty() {
-                            return Some(m.messages.clone());
+                // Prime TDLib's message cache; the result is intentionally
+                // discarded (cold chats answer this with ~1 message).
+                let _ = functions::get_chat_history(chat_id, 0, 0, 100, false, cid).await;
+
+                // Page from the oldest id we hold, oldest-anchored, until we
+                // have TARGET messages or a batch returns empty.
+                let mut acc: Vec<tdlib_rs::types::Message> = Vec::new();
+                let mut from: i64 = 0;
+                loop {
+                    match functions::get_chat_history(chat_id, from, 0, BATCH, false, cid).await {
+                        Ok(Messages::Messages(m)) => {
+                            let batch: Vec<tdlib_rs::types::Message> =
+                                m.messages.into_iter().flatten().collect();
+                            if batch.is_empty() {
+                                break;
+                            }
+                            // Anchor the next page at the oldest id in this batch
+                            // (TDLib returns newest-first).
+                            from = batch.iter().map(|msg| msg.id).min().unwrap_or(0);
+                            acc.extend(batch);
+                            if acc.len() >= TARGET || from == 0 {
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(code = e.code, msg = %e.message, "get_chat_history (initial) failed");
+                            break;
                         }
                     }
-                    None
-                };
-                if let Some(msgs) = pick(&second).or_else(|| pick(&first)) {
-                    this.ingest_history(msgs, true);
-                } else {
-                    // Both empty: still ingest empty as initial (won't set
-                    // reached_top now, so older paging stays available).
-                    this.ingest_history(Vec::new(), true);
                 }
+                acc
+            },
+            move |msgs| {
+                // `ingest_history` takes Vec<Option<Message>>; wrap them.
+                let wrapped: Vec<Option<tdlib_rs::types::Message>> =
+                    msgs.into_iter().map(Some).collect();
+                this.ingest_history(wrapped, true);
             },
         );
     }

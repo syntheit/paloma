@@ -404,7 +404,7 @@ fn main_page(client: &TdClient) -> adw::NavigationPage {
 /// The placeholder content page shown before any chat is selected.
 fn empty_content_page() -> adw::NavigationPage {
     let content_status = adw::StatusPage::builder()
-        .icon_name("chat-symbolic")
+        .icon_name("chat-message-new-symbolic")
         .title("Select a chat")
         .description("Choose a conversation from the list.")
         .build();

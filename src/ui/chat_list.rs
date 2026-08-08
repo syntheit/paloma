@@ -212,6 +212,10 @@ impl ChatList {
         let list_view = gtk::ListView::new(Some(selection), Some(factory));
         list_view.add_css_class("navigation-sidebar");
 
+        // Open a chat on a single click (default GtkListView activates only on
+        // double-click/Enter). Mirrors paper-plane's sidebar (single-click-activate=True).
+        list_view.set_single_click_activate(true);
+
         // Activating a row opens its chat. The NoSelection model hands us the
         // position within the *sorted* view, so we read the item straight off it.
         {
@@ -239,7 +243,7 @@ impl ChatList {
         let loading = adw::Bin::builder().child(&spinner).build();
 
         let empty = adw::StatusPage::builder()
-            .icon_name("chat-symbolic")
+            .icon_name("chat-message-new-symbolic")
             .title("No chats yet")
             .build();
 

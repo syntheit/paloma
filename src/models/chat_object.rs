@@ -8,7 +8,7 @@ use gtk::glib;
 use gtk::prelude::*;
 use gtk::subclass::prelude::*;
 
-use tdlib_rs::enums::{ChatList, MessageContent};
+use tdlib_rs::enums::ChatList;
 use tdlib_rs::types;
 
 mod imp {
@@ -94,12 +94,5 @@ fn photo_file_id_of(chat: &types::Chat) -> i32 {
 /// placeholder (e.g. `[Photo]`). Kept public so the update pump can reuse it when
 /// a `ChatLastMessage` update arrives.
 pub fn message_preview(msg: &types::Message) -> String {
-    match &msg.content {
-        MessageContent::MessageText(t) => t.text.text.clone(),
-        MessageContent::MessagePhoto(_) => "[Photo]".to_string(),
-        MessageContent::MessageVideo(_) => "[Video]".to_string(),
-        MessageContent::MessageSticker(_) => "[Sticker]".to_string(),
-        MessageContent::MessageDocument(_) => "[Document]".to_string(),
-        _ => "[Media]".to_string(),
-    }
+    crate::models::message_object::content_text(&msg.content)
 }
