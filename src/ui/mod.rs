@@ -2,6 +2,7 @@
 //! the app stays legible and fully type-checked in one language.
 
 pub mod chat_list;
+pub mod chat_view;
 pub mod login;
 
 use gtk::gdk;
@@ -22,6 +23,55 @@ const APP_CSS: &str = "
     background-color: #ffffff;
     border-radius: 12px;
     padding: 12px;
+}
+
+/* --- Message history bubbles --- */
+.msg-list {
+    background: transparent;
+}
+.msg-list > row {
+    padding: 1px 8px;
+}
+.msg-bubble {
+    padding: 6px 10px;
+    border-radius: 14px;
+    margin: 1px 4px;
+}
+.msg-bubble .msg-body {
+    /* let bubbles size to content up to a comfortable reading width */
+}
+.msg-in {
+    background-color: alpha(@card_fg_color, 0.08);
+}
+.msg-out {
+    background-color: @accent_bg_color;
+    color: @accent_fg_color;
+}
+.msg-out .msg-time,
+.msg-out .msg-sender {
+    color: alpha(@accent_fg_color, 0.8);
+}
+.msg-pending {
+    opacity: 0.6;
+}
+.msg-sender {
+    font-size: 0.82em;
+    font-weight: bold;
+}
+.msg-time {
+    font-size: 0.72em;
+}
+.msg-compose {
+    background-color: @view_bg_color;
+}
+.msg-entry {
+    background: transparent;
+    font-size: 1em;
+}
+.msg-entry-scroll {
+    border-radius: 18px;
+    background-color: alpha(@card_fg_color, 0.08);
+    padding: 2px 4px;
 }
 ";
 

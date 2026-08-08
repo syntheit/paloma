@@ -6,5 +6,4 @@ pub mod chat_object;
 pub mod message_object;
 
 pub use chat_object::ChatObject;
-#[allow(unused_imports)]
 pub use message_object::MessageObject;

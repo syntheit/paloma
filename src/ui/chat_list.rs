@@ -44,6 +44,8 @@ struct Inner {
     client: crate::tdlib::TdClient,
     /// The model backing the `ListView`; holds one [`ChatObject`] per chat.
     store: gio::ListStore,
+    /// The sorter driving the visible order; re-run when a chat's order changes.
+    sorter: gtk::CustomSorter,
     /// `chat_id` → the live [`ChatObject`] in the store, for O(1) updates.
     index: RefCell<HashMap<i64, ChatObject>>,
     /// Switches between the "loading", "list" and "empty" views.
@@ -53,7 +55,12 @@ struct Inner {
 impl ChatList {
     /// Build the chat sidebar for `client`, kick off the initial load, and
     /// begin draining the client's update stream.
-    pub fn new(client: crate::tdlib::TdClient) -> Self {
+    /// Build the chat sidebar for `client`. `on_activate` is invoked with the
+    /// `(chat_id, title)` of a row when the user activates it (click / Enter).
+    pub fn new(
+        client: crate::tdlib::TdClient,
+        on_activate: impl Fn(i64, String) + 'static,
+    ) -> Self {
         let store = gio::ListStore::new::<ChatObject>();
 
         // --- Row factory: builds & recycles one widget per visible slot. -----
@@ -155,10 +162,34 @@ impl ChatList {
             }
         });
 
+        // --- Sort by Telegram chat order (descending: higher order first, so
+        // pinned/most-recent chats sort to the top). The SortListModel wraps the
+        // backing store; the ListView sees the sorted view, the index/store
+        // still address rows by insertion for O(1) mutation.
+        let sorter = gtk::CustomSorter::new(move |a, b| {
+            let a = a.downcast_ref::<ChatObject>().map(|c| c.order()).unwrap_or(0);
+            let b = b.downcast_ref::<ChatObject>().map(|c| c.order()).unwrap_or(0);
+            // Descending order.
+            b.cmp(&a).into()
+        });
+        let sort_model = gtk::SortListModel::new(Some(store.clone()), Some(sorter.clone()));
+
         // --- ListView in a scroller. ----------------------------------------
-        let selection = gtk::NoSelection::new(Some(store.clone()));
+        let selection = gtk::NoSelection::new(Some(sort_model.clone()));
         let list_view = gtk::ListView::new(Some(selection), Some(factory));
         list_view.add_css_class("navigation-sidebar");
+
+        // Activating a row opens its chat. The NoSelection model hands us the
+        // position within the *sorted* view, so we read the item straight off it.
+        {
+            let sort_model = sort_model.clone();
+            let on_activate = std::rc::Rc::new(on_activate);
+            list_view.connect_activate(move |_, pos| {
+                if let Some(obj) = sort_model.item(pos).and_downcast::<ChatObject>() {
+                    on_activate(obj.id(), obj.title());
+                }
+            });
+        }
 
         let scroller = gtk::ScrolledWindow::builder()
             .hscrollbar_policy(gtk::PolicyType::Never)
@@ -188,6 +219,7 @@ impl ChatList {
         let inner = Rc::new(Inner {
             client,
             store,
+            sorter,
             index: RefCell::new(HashMap::new()),
             stack: stack.clone(),
         });
@@ -235,8 +267,10 @@ impl ChatList {
                 self.inner.store.append(&obj);
                 self.inner.index.borrow_mut().insert(id, obj);
                 self.update_visibility();
+                self.resort();
             }
             Update::ChatLastMessage(u) => {
+                let order = Self::main_order(&u.positions);
                 if let Some(obj) = self.inner.index.borrow().get(&u.chat_id) {
                     obj.set_last_message(
                         u.last_message
@@ -244,16 +278,23 @@ impl ChatList {
                             .map(crate::models::chat_object::message_preview)
                             .unwrap_or_default(),
                     );
-                    obj.set_order(Self::main_order(&u.positions));
+                    obj.set_order(order);
                 }
                 self.notify_changed(u.chat_id);
+                self.resort();
             }
             Update::ChatPosition(u) => {
                 if matches!(u.position.list, TdChatList::Main) {
-                    if let Some(obj) = self.inner.index.borrow().get(&u.chat_id) {
-                        obj.set_order(u.position.order);
+                    // order == 0 means the chat left the Main list — drop it.
+                    if u.position.order == 0 {
+                        self.remove_chat(u.chat_id);
+                    } else {
+                        if let Some(obj) = self.inner.index.borrow().get(&u.chat_id) {
+                            obj.set_order(u.position.order);
+                        }
+                        self.notify_changed(u.chat_id);
+                        self.resort();
                     }
-                    self.notify_changed(u.chat_id);
                 }
             }
             Update::ChatTitle(u) => {
@@ -355,6 +396,7 @@ impl ChatList {
             self.inner.index.borrow_mut().insert(id, obj);
         }
         self.update_visibility();
+        self.resort();
     }
 
     /// Force the factory to re-bind the row for `chat_id`, reflecting mutations
@@ -369,6 +411,32 @@ impl ChatList {
                 }
             }
         }
+    }
+
+    /// Ask the sorter to re-run after an `order` change. `SorterChange::Different`
+    /// tells the SortListModel the ordering may have changed for any item.
+    fn resort(&self) {
+        self.inner
+            .sorter
+            .changed(gtk::SorterChange::Different);
+    }
+
+    /// Remove a chat from the store and index (e.g. it left the Main list).
+    fn remove_chat(&self, chat_id: i64) {
+        if self.inner.index.borrow_mut().remove(&chat_id).is_none() {
+            return;
+        }
+        let store = &self.inner.store;
+        let n = store.n_items();
+        for pos in 0..n {
+            if let Some(obj) = store.item(pos).and_downcast::<ChatObject>() {
+                if obj.id() == chat_id {
+                    store.remove(pos);
+                    break;
+                }
+            }
+        }
+        self.update_visibility();
     }
 
     /// Show "list" once we have chats, otherwise "empty". Called after each load.

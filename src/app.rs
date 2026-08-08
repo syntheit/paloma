@@ -8,9 +8,13 @@
 use adw::prelude::*;
 use gtk::glib;
 
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use crate::config;
 use crate::tdlib::{auth, TdClient};
 use crate::ui;
+use crate::ui::chat_view::ChatView;
 
 /// Build the main window and kick off the auth pipeline.
 ///
@@ -245,8 +249,61 @@ fn route_phase(nav: &adw::NavigationView, client: &TdClient, phase: auth::Phase)
 
 /// The connected main view: an adaptive sidebar/content split that collapses to
 /// a single column on narrow (mobile) widths.
+///
+/// Activating a chat row builds a [`ChatView`], installs it as the split's
+/// *content* page, and calls `set_show_content(true)`. On desktop the content
+/// pane is always visible; when collapsed (mobile) `AdwNavigationSplitView`
+/// treats sidebar/content as a navigation stack, so this pushes the chat as its
+/// own page with an automatic back button that returns to the list.
 fn main_page(client: &TdClient) -> adw::NavigationPage {
-    let chat_list = ui::chat_list::ChatList::new(client.clone());
+    let split = adw::NavigationSplitView::new();
+    split.set_min_sidebar_width(280.0);
+    split.set_max_sidebar_width(360.0);
+
+    // The empty-state placeholder shown before any chat is selected.
+    let empty_page = empty_content_page();
+    split.set_content(Some(&empty_page));
+
+    // The currently-open ChatView, so we can `close_chat` the previous one when
+    // switching chats.
+    let current: Rc<RefCell<Option<ChatView>>> = Rc::new(RefCell::new(None));
+
+    // Row activation → open the chat in the content pane.
+    let on_activate = {
+        let split = split.clone();
+        let client = client.clone();
+        let current = current.clone();
+        move |chat_id: i64, title: String| {
+            // If this chat is already open, just reveal the content pane.
+            if let Some(view) = current.borrow().as_ref() {
+                if view.chat_id() == chat_id {
+                    split.set_show_content(true);
+                    return;
+                }
+            }
+            // Close the previously-open chat (stops its update streaming).
+            if let Some(prev) = current.borrow_mut().take() {
+                prev.close();
+            }
+
+            let view = ChatView::new(client.clone(), chat_id);
+            let header = adw::HeaderBar::new();
+            let toolbar = adw::ToolbarView::builder().content(view.widget()).build();
+            toolbar.add_top_bar(&header);
+            let page = adw::NavigationPage::builder()
+                .title(if title.is_empty() { "Chat" } else { &title })
+                .tag("content")
+                .child(&toolbar)
+                .build();
+            split.set_content(Some(&page));
+            split.set_show_content(true);
+
+            view.open();
+            *current.borrow_mut() = Some(view);
+        }
+    };
+
+    let chat_list = ui::chat_list::ChatList::new(client.clone(), on_activate);
 
     // Sidebar: the chat list.
     let sidebar_header = adw::HeaderBar::new();
@@ -259,29 +316,7 @@ fn main_page(client: &TdClient) -> adw::NavigationPage {
         .tag("sidebar")
         .child(&sidebar_toolbar)
         .build();
-
-    // Content: empty-state placeholder until a chat is selected.
-    let content_status = adw::StatusPage::builder()
-        .icon_name("chat-symbolic")
-        .title("Select a chat")
-        .description("Choose a conversation from the list.")
-        .build();
-    let content_header = adw::HeaderBar::new();
-    let content_toolbar = adw::ToolbarView::builder()
-        .content(&content_status)
-        .build();
-    content_toolbar.add_top_bar(&content_header);
-    let content_page = adw::NavigationPage::builder()
-        .title("Paloma")
-        .tag("content")
-        .child(&content_toolbar)
-        .build();
-
-    let split = adw::NavigationSplitView::new();
     split.set_sidebar(Some(&sidebar_page));
-    split.set_content(Some(&content_page));
-    split.set_min_sidebar_width(280.0);
-    split.set_max_sidebar_width(360.0);
 
     let bin = adw::BreakpointBin::builder()
         .child(&split)
@@ -302,6 +337,25 @@ fn main_page(client: &TdClient) -> adw::NavigationPage {
         .title("Paloma")
         .tag("main")
         .child(&bin)
+        .build()
+}
+
+/// The placeholder content page shown before any chat is selected.
+fn empty_content_page() -> adw::NavigationPage {
+    let content_status = adw::StatusPage::builder()
+        .icon_name("chat-symbolic")
+        .title("Select a chat")
+        .description("Choose a conversation from the list.")
+        .build();
+    let content_header = adw::HeaderBar::new();
+    let content_toolbar = adw::ToolbarView::builder()
+        .content(&content_status)
+        .build();
+    content_toolbar.add_top_bar(&content_header);
+    adw::NavigationPage::builder()
+        .title("Paloma")
+        .tag("content")
+        .child(&content_toolbar)
         .build()
 }
 
