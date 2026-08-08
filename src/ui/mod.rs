@@ -34,18 +34,20 @@ const APP_CSS: &str = "
 }
 .msg-bubble {
     padding: 6px 10px;
-    border-radius: 14px;
+    border-radius: 16px;
     margin: 1px 4px;
 }
 .msg-bubble .msg-body {
     /* let bubbles size to content up to a comfortable reading width */
 }
-.msg-in {
-    background-color: alpha(@card_fg_color, 0.08);
-}
 .msg-out {
     background-color: @accent_bg_color;
     color: @accent_fg_color;
+    margin-left: 48px;
+}
+.msg-in {
+    background-color: alpha(@card_fg_color, 0.08);
+    margin-right: 48px;
 }
 .msg-out .msg-time,
 .msg-out .msg-sender {

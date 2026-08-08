@@ -405,9 +405,6 @@ impl ChatList {
     fn hydrate_chats(&self, ids: Vec<i64>) {
         let cid = self.inner.client.client_id();
         for id in ids {
-            if self.inner.index.borrow().contains_key(&id) {
-                continue;
-            }
             let this = self.clone();
             crate::runtime::spawn(
                 async move {
@@ -435,13 +432,14 @@ impl ChatList {
             obj.set_title(chat.title.as_str());
             obj.set_unread_count(chat.unread_count);
             obj.set_order(Self::main_order(&chat.positions));
-            obj.set_last_message(
-                chat
-                    .last_message
-                    .as_ref()
-                    .map(crate::models::chat_object::message_preview)
-                    .unwrap_or_default(),
-            );
+            let preview = chat
+                .last_message
+                .as_ref()
+                .map(crate::models::chat_object::message_preview)
+                .unwrap_or_default();
+            if !preview.is_empty() {
+                obj.set_last_message(preview);
+            }
             obj.set_photo_file_id(chat.photo.as_ref().map(|p| p.small.id).unwrap_or(0));
             self.notify_changed(id);
         } else {

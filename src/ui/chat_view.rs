@@ -69,14 +69,15 @@ struct Inner {
     chat_id: i64,
     /// Our own user id, resolved lazily via `get_me`, to distinguish grouping.
     me_id: Cell<i64>,
+    /// True once we've learned this chat is a basic group / supergroup; sender
+    /// names are only shown for groups.
+    is_group: Cell<bool>,
     /// The model backing the `ListView`; oldest message first, newest last.
     store: gio::ListStore,
     /// `message_id` → live [`MessageObject`] for O(1) updates.
     index: RefCell<HashMap<i64, MessageObject>>,
     /// Resolved sender display names, `user_id` → name, to label group messages.
     names: RefCell<HashMap<i64, String>>,
-    /// Resolved sender avatar file ids, `user_id` → small photo file_id.
-    avatars: RefCell<HashMap<i64, i32>>,
     /// Oldest loaded message id, used as `from_message_id` when paging older
     /// history at the top. `0` before the first batch.
     oldest_id: Cell<i64>,
@@ -231,10 +232,10 @@ impl ChatView {
             files,
             chat_id,
             me_id: Cell::new(0),
+            is_group: Cell::new(false),
             store,
             index: RefCell::new(HashMap::new()),
             names: RefCell::new(HashMap::new()),
-            avatars: RefCell::new(HashMap::new()),
             oldest_id: Cell::new(0),
             reached_top: Cell::new(false),
             loading_older: Cell::new(false),
@@ -295,6 +296,28 @@ impl ChatView {
             move |res| {
                 if let Ok(UserEnum::User(me)) = res {
                     this.inner.me_id.set(me.id);
+                }
+            },
+        );
+
+        let this = self.clone();
+        crate::runtime::spawn(
+            async move { functions::get_chat(chat_id, cid).await },
+            move |res| {
+                if let Ok(tdlib_rs::enums::Chat::Chat(chat)) = res {
+                    let is_group = matches!(
+                        chat.r#type,
+                        tdlib_rs::enums::ChatType::BasicGroup(_)
+                            | tdlib_rs::enums::ChatType::Supergroup(_)
+                    );
+                    this.inner.is_group.set(is_group);
+                    if is_group {
+                        // Names weren't resolved while we thought this was a 1:1
+                        // chat; resolve them now that we know it's a group.
+                        this.resolve_all_sender_names();
+                    }
+                    // Re-bind so sender names appear/disappear per group-ness.
+                    this.rebind_all();
                 }
             },
         );
@@ -684,20 +707,44 @@ impl ChatView {
         if obj.is_outgoing() {
             return;
         }
+        // Sender names are only shown in group chats.
+        if !self.inner.is_group.get() {
+            return;
+        }
         if let MessageSender::User(u) = sender {
             if let Some(name) = self.inner.names.borrow().get(&u.user_id) {
                 obj.set_sender_name(name.clone());
-                if let Some(fid) = self.inner.avatars.borrow().get(&u.user_id) {
-                    obj.set_avatar_file_id(*fid);
-                }
             } else {
                 to_resolve.push(u.user_id);
             }
         }
     }
 
-    /// Resolve display names + avatars for the given user ids, then re-apply.
+    /// Resolve sender names for all currently-loaded incoming messages (used
+    /// once we learn the chat is a group, so names weren't resolved earlier).
+    fn resolve_all_sender_names(&self) {
+        let mut ids: Vec<i64> = Vec::new();
+        let store = &self.inner.store;
+        let n = store.n_items();
+        for pos in 0..n {
+            if let Some(obj) = store.item(pos).and_downcast::<MessageObject>() {
+                if !obj.is_outgoing() && obj.sender_name().is_empty() {
+                    let sid = obj.sender_id();
+                    if sid != 0 && !ids.contains(&sid) {
+                        ids.push(sid);
+                    }
+                }
+            }
+        }
+        self.resolve_names(ids);
+    }
+
+    /// Resolve display names for the given user ids, then re-apply.
     fn resolve_names(&self, user_ids: Vec<i64>) {
+        // Sender names are only shown in group chats.
+        if !self.inner.is_group.get() {
+            return;
+        }
         for uid in user_ids {
             if uid == 0 || self.inner.names.borrow().contains_key(&uid) {
                 continue;
@@ -710,13 +757,7 @@ impl ChatView {
                     if let Ok(UserEnum::User(user)) = res {
                         let name = display_name(&user.first_name, &user.last_name);
                         this.inner.names.borrow_mut().insert(uid, name.clone());
-                        let avatar_id = user
-                            .profile_photo
-                            .as_ref()
-                            .map(|p| p.small.id)
-                            .unwrap_or(0);
-                        this.inner.avatars.borrow_mut().insert(uid, avatar_id);
-                        this.apply_name_to_rows(uid, &name, avatar_id);
+                        this.apply_name_to_rows(uid, &name);
                     }
                 },
             );
@@ -724,8 +765,12 @@ impl ChatView {
     }
 
     /// After a name resolves, stamp it onto every already-inserted row by `uid`
-    /// and re-bind those rows (which also picks up the resolved avatar).
-    fn apply_name_to_rows(&self, uid: i64, name: &str, avatar_id: i32) {
+    /// and re-bind those rows.
+    fn apply_name_to_rows(&self, uid: i64, name: &str) {
+        // Sender names are only shown in group chats.
+        if !self.inner.is_group.get() {
+            return;
+        }
         let store = &self.inner.store;
         let n = store.n_items();
         for pos in 0..n {
@@ -734,7 +779,6 @@ impl ChatView {
                     if obj.sender_name().is_empty() {
                         obj.set_sender_name(name.to_string());
                     }
-                    obj.set_avatar_file_id(avatar_id);
                     store.items_changed(pos, 1, 1);
                 }
             }
@@ -1247,29 +1291,25 @@ impl ChatView {
 
 // --- Row factory helpers (free fns; the recycling factory captures no `self`) -
 
-/// Build one recycled row: `[avatar] [bubble{ reply, sender, body, photo,
-/// caption, time }]`. Widgets are named so `bind_row` can retrieve them.
+/// Build one recycled row: `[bubble{ reply, sender, body, photo, caption,
+/// time }]`. Widgets are named so `bind_row` can retrieve them.
 fn build_row(_: &gtk::SignalListItemFactory, list_item: &glib::Object) {
     let list_item = list_item
         .downcast_ref::<gtk::ListItem>()
         .expect("list item is a ListItem");
 
-    // Horizontal: avatar column + bubble column.
+    // Full-width row holding a single bubble; the bubble's own halign pushes it
+    // to one side.
     let row = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .spacing(6)
         .build();
     row.set_widget_name("msg-row");
 
-    // Avatar (incoming only; hidden/reserved for grouping + outgoing).
-    let avatar = adw::Avatar::new(32, None, true);
-    avatar.set_valign(gtk::Align::End);
-    avatar.set_widget_name("avatar");
-    row.append(&avatar);
-
     let bubble = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(2)
+        .hexpand(true)
         .build();
     bubble.add_css_class("msg-bubble");
     bubble.set_widget_name("bubble");
@@ -1323,6 +1363,7 @@ fn build_row(_: &gtk::SignalListItemFactory, list_item: &glib::Object) {
         .wrap(true)
         .wrap_mode(gtk::pango::WrapMode::WordChar)
         .selectable(true)
+        .max_width_chars(36)
         .build();
     body.set_widget_name("body");
     bubble.append(&body);
@@ -1362,9 +1403,7 @@ fn bind_row(list_item: &glib::Object, store: &gio::ListStore, files: &FileStore)
     // the store is already ascending-sorted by id === chronological).
     let pos = list_item.position();
     let prev = neighbour(store, pos, -1);
-    let next = neighbour(store, pos, 1);
     let show_sender = !grouped_with(Some(&item), prev.as_ref());
-    let show_avatar = !grouped_with(next.as_ref(), Some(&item));
 
     row.set_halign(gtk::Align::Fill);
 
@@ -1380,51 +1419,6 @@ fn bind_row(list_item: &glib::Object, store: &gio::ListStore, files: &FileStore)
         bubble.add_css_class(if outgoing { "msg-out" } else { "msg-in" });
         if item.is_pending() {
             bubble.add_css_class("msg-pending");
-        }
-    }
-
-    // Avatar slot: only incoming, only on the last row of a run.
-    if let Some(avatar) = find::<adw::Avatar>(&root, "avatar") {
-        if outgoing {
-            avatar.set_visible(false);
-            // Drop any previous incoming sender's photo so a recycled outgoing
-            // row can't flash a stale avatar.
-            avatar.set_custom_image(gtk::gdk::Paintable::NONE);
-        } else {
-            avatar.set_visible(true);
-            // Keep the column width stable inside a run by reserving the slot:
-            // hidden avatars still occupy their allocation via opacity.
-            avatar.set_opacity(if show_avatar { 1.0 } else { 0.0 });
-            avatar.set_text(Some(&item.sender_name()));
-            avatar.set_show_initials(true);
-            avatar.set_custom_image(gtk::gdk::Paintable::NONE);
-            // Swap in the sender's photo if we have a file id for it.
-            if show_avatar {
-                let file_id = item.avatar_file_id();
-                if file_id != 0 {
-                    if let Some(path) = files.cached(file_id) {
-                        if let Ok(texture) = gtk::gdk::Texture::from_filename(&path) {
-                            avatar.set_custom_image(Some(&texture));
-                        }
-                    } else {
-                        let want = item.id();
-                        let avatar2 = avatar.clone();
-                        let li = list_item.clone();
-                        files.download(file_id, 12, move |path| {
-                            // The row may have been recycled onto another item
-                            // by the time this download lands; bail if so.
-                            if li.item().and_downcast::<MessageObject>().map(|m| m.id())
-                                != Some(want)
-                            {
-                                return;
-                            }
-                            if let Ok(texture) = gtk::gdk::Texture::from_filename(&path) {
-                                avatar2.set_custom_image(Some(&texture));
-                            }
-                        });
-                    }
-                }
-            }
         }
     }
 
