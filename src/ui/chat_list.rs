@@ -136,6 +136,12 @@ impl ChatList {
                 .item()
                 .and_downcast::<ChatObject>()
                 .expect("list item holds a ChatObject");
+            tracing::info!(
+                "SIDEBAR bind id={} title={:?} last_message={:?}",
+                item.id(),
+                item.title(),
+                item.last_message()
+            );
             let hbox = list_item
                 .child()
                 .and_downcast::<gtk::Box>()
@@ -305,6 +311,12 @@ impl ChatList {
 
         match update {
             Update::NewChat(u) => {
+                tracing::info!(
+                    "SIDEBAR NewChat id={} title={:?} last_some={}",
+                    u.chat.id,
+                    u.chat.title,
+                    u.chat.last_message.is_some()
+                );
                 let id = u.chat.id;
                 // Dedupe by id: ignore chats we already track.
                 if self.inner.index.borrow().contains_key(&id) {
@@ -317,6 +329,13 @@ impl ChatList {
                 self.resort();
             }
             Update::ChatLastMessage(u) => {
+                let in_index = self.inner.index.borrow().contains_key(&u.chat_id);
+                tracing::info!(
+                    "SIDEBAR ChatLastMessage id={} in_index={} last_some={}",
+                    u.chat_id,
+                    in_index,
+                    u.last_message.is_some()
+                );
                 let order = Self::main_order(&u.positions);
                 if let Some(obj) = self.inner.index.borrow().get(&u.chat_id) {
                     obj.set_last_message(
@@ -395,8 +414,14 @@ impl ChatList {
                 }
             },
             move |res| match res {
-                Ok(ids) => this.hydrate_chats(ids),
-                Err(_e) => this.update_visibility(),
+                Ok(ids) => {
+                    tracing::info!("SIDEBAR initial_load: {} chat ids", ids.len());
+                    this.hydrate_chats(ids);
+                }
+                Err(e) => {
+                    tracing::info!("SIDEBAR initial_load ERR {:?}", e);
+                    this.update_visibility();
+                }
             },
         );
     }
@@ -416,7 +441,15 @@ impl ChatList {
                 },
                 move |res| {
                     if let Some(chat) = res {
+                        tracing::info!(
+                            "SIDEBAR get_chat id={} title={:?} last_message_some={}",
+                            chat.id,
+                            chat.title,
+                            chat.last_message.is_some()
+                        );
                         this.add_or_update(chat);
+                    } else {
+                        tracing::info!("SIDEBAR get_chat id={} FAILED", id);
                     }
                 },
             );
@@ -446,8 +479,19 @@ impl ChatList {
             "add_or_update"
         );
 
+        let in_index = self.inner.index.borrow().contains_key(&id);
+        tracing::info!(
+            "SIDEBAR add_or_update id={} title={:?} has_last={} preview_len={} in_index={}",
+            id,
+            chat.title,
+            chat.last_message.is_some(),
+            preview.len(),
+            in_index
+        );
+
         let existing = self.inner.index.borrow().get(&id).cloned();
         if let Some(obj) = existing {
+            tracing::info!("SIDEBAR add_or_update id={} branch=existing preview_empty={}", id, preview.is_empty());
             obj.set_title(chat.title.as_str());
             obj.set_unread_count(chat.unread_count);
             obj.set_order(Self::main_order(&chat.positions));
@@ -457,6 +501,7 @@ impl ChatList {
             obj.set_photo_file_id(chat.photo.as_ref().map(|p| p.small.id).unwrap_or(0));
             self.notify_changed(id);
         } else {
+            tracing::info!("SIDEBAR add_or_update id={} branch=new preview_empty={}", id, preview.is_empty());
             let obj = ChatObject::from_chat(&chat);
             self.inner.store.append(&obj);
             self.inner.index.borrow_mut().insert(id, obj);
@@ -478,6 +523,7 @@ impl ChatList {
     /// chat's preview. Keyed by `chat_id` through the index, so it's safe against
     /// row recycling. Only called for chats that arrived without a preview.
     fn fetch_last_message(&self, chat_id: i64) {
+        tracing::info!("SIDEBAR fetch_last spawn id={}", chat_id);
         let cid = self.inner.client.client_id();
         let this = self.clone();
         crate::runtime::spawn(
@@ -489,13 +535,32 @@ impl ChatList {
                 }
             },
             move |res| {
+                let got_msg = res.is_some();
                 if let Some(msg) = res {
+                    let preview = crate::models::chat_object::message_preview(&msg);
+                    let obj_found = this.inner.index.borrow().contains_key(&chat_id);
+                    tracing::info!(
+                        "SIDEBAR fetch_last done id={} got_msg={} preview={:?} obj_found={}",
+                        chat_id,
+                        got_msg,
+                        preview,
+                        obj_found
+                    );
                     if let Some(obj) = this.inner.index.borrow().get(&chat_id) {
-                        obj.set_last_message(crate::models::chat_object::message_preview(&msg));
+                        obj.set_last_message(preview);
                     } else {
                         return;
                     }
                     this.notify_changed(chat_id);
+                } else {
+                    let obj_found = this.inner.index.borrow().contains_key(&chat_id);
+                    tracing::info!(
+                        "SIDEBAR fetch_last done id={} got_msg={} preview={:?} obj_found={}",
+                        chat_id,
+                        got_msg,
+                        "",
+                        obj_found
+                    );
                 }
             },
         );
