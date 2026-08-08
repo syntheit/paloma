@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="128" height="128" viewBox="0 0 128 128" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#3584e4"/>
+      <stop offset="1" stop-color="#1a5fb4"/>
+    </linearGradient>
+  </defs>
+  <rect x="8" y="8" width="112" height="112" rx="26" fill="url(#bg)"/>
+  <!-- A stylised paper plane / pigeon in flight. -->
+  <path d="M28 62 L100 30 L74 100 L60 74 Z" fill="#ffffff" fill-opacity="0.95"/>
+  <path d="M60 74 L100 30 L74 74 Z" fill="#ffffff" fill-opacity="0.55"/>
+  <path d="M60 74 L60 96 L72 82 Z" fill="#ffffff" fill-opacity="0.75"/>
+</svg>

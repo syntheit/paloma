@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist>
+  <schema id="io.matv.Paloma" path="/io/matv/Paloma/">
+    <key name="window-width" type="i">
+      <default>420</default>
+      <summary>Main window width</summary>
+      <description>The width of the main window in pixels, restored on launch.</description>
+    </key>
+    <key name="window-height" type="i">
+      <default>720</default>
+      <summary>Main window height</summary>
+      <description>The height of the main window in pixels, restored on launch.</description>
+    </key>
+    <key name="window-maximized" type="b">
+      <default>false</default>
+      <summary>Main window maximized state</summary>
+      <description>Whether the main window was maximized when last closed.</description>
+    </key>
+  </schema>
+</schemalist>

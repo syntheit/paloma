@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.matv.Paloma</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+
+  <name>Paloma</name>
+  <summary>Chat on Telegram</summary>
+
+  <description>
+    <p>
+      Paloma is a native GTK4/libadwaita client for Telegram, built on TDLib. It
+      is designed mobile-first for GNOME Shell Mobile and adapts cleanly to the
+      desktop.
+    </p>
+    <p>Features:</p>
+    <ul>
+      <li>Sign in by phone number, code, two-factor password or QR code</li>
+      <li>Browse your chats with a recycled, scalable chat list</li>
+      <li>Adaptive one/two-column layout for phone and desktop</li>
+    </ul>
+  </description>
+
+  <launchable type="desktop-id">io.matv.Paloma.desktop</launchable>
+
+  <url type="homepage">https://github.com/syntheit/paloma</url>
+  <url type="bugtracker">https://github.com/syntheit/paloma/issues</url>
+  <url type="vcs-browser">https://github.com/syntheit/paloma</url>
+
+  <developer id="io.matv">
+    <name>Daniel Miller</name>
+  </developer>
+
+  <content_rating type="oars-1.1" />
+
+  <categories>
+    <category>Network</category>
+    <category>InstantMessaging</category>
+  </categories>
+
+  <requires>
+    <display_length compare="ge">360</display_length>
+  </requires>
+  <recommends>
+    <control>keyboard</control>
+    <control>pointing</control>
+    <control>touch</control>
+  </recommends>
+
+  <releases>
+    <release version="0.1.0" date="2026-08-08">
+      <description>
+        <p>Foundation release: TDLib backend, authentication flow and chat list scaffold.</p>
+      </description>
+    </release>
+  </releases>
+
+  <screenshots>
+    <!-- Screenshots will be added after the first stable release. -->
+  </screenshots>
+</component>

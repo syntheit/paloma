@@ -1,0 +1,14 @@
+[Desktop Entry]
+Name=Paloma
+GenericName=Telegram Client
+Comment=Chat on Telegram
+Type=Application
+Categories=Network;InstantMessaging;Chat;
+Keywords=telegram;chat;messaging;messenger;
+Exec=paloma
+Icon=io.matv.Paloma
+Terminal=false
+StartupNotify=true
+DBusActivatable=false
+StartupWMClass=paloma
+X-Purism-FormFactor=Workstation;Mobile;

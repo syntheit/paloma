@@ -1,0 +1,57 @@
+[package]
+name = "paloma"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+description = "Native GTK4/libadwaita Telegram client"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/syntheit/paloma"
+readme = "README.md"
+keywords = ["gtk4", "libadwaita", "telegram", "tdlib", "gnome"]
+categories = ["gui"]
+default-run = "paloma"
+
+[[bin]]
+name = "paloma"
+path = "src/main.rs"
+
+# Headless backend smoke check — boots the TDLib client, drives the auth state
+# machine to WaitPhoneNumber and exits. Reuses the real backend layer.
+[[bin]]
+name = "tdlib-check"
+path = "src/bin/tdlib-check.rs"
+
+[dependencies]
+# GTK / libadwaita bindings. v4_12 ABI floor; libadwaita v1_6 gives us
+# NavigationSplitView, BreakpointBin, AboutDialog, etc.
+gtk = { package = "gtk4", version = "0.11", features = ["v4_12"] }
+adw = { package = "libadwaita", version = "0.9", features = ["v1_6"] }
+
+# TDLib backend. `pkg-config` links the system libtdjson (nixpkgs `tdlib`),
+# matching the proven spike wiring; default features off so it doesn't try to
+# download/build its own copy.
+tdlib-rs = { version = "1.4", default-features = false, features = ["pkg-config"] }
+
+# Async plumbing: a shared tokio runtime bridged to the GLib main loop, and the
+# unbounded channel that carries the TDLib update stream onto the GTK thread.
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
+async-channel = "2"
+
+# Config: credentials.toml parsing + XDG dirs.
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+dirs = "5"
+
+# QR login: render the tg:// auth link to an SVG the login page can display.
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
+
+# Misc.
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true

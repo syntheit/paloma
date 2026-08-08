@@ -1,0 +1,95 @@
+//! [`ChatObject`]: the list-item GObject backing a row in the chat list.
+//!
+//! One instance per chat. Its properties are bound by the sidebar's
+//! `SignalListItemFactory`, so mutating a setter (e.g. [`ChatObject::set_last_message`])
+//! automatically refreshes the visible row without rebuilding it.
+
+use gtk::glib;
+use gtk::prelude::*;
+use gtk::subclass::prelude::*;
+
+use tdlib_rs::enums::{ChatList, MessageContent};
+use tdlib_rs::types;
+
+mod imp {
+    use super::*;
+    use std::cell::{Cell, RefCell};
+
+    #[derive(glib::Properties, Default)]
+    #[properties(wrapper_type = super::ChatObject)]
+    pub struct ChatObject {
+        #[property(get, construct_only)]
+        pub id: Cell<i64>,
+        #[property(get, set)]
+        pub title: RefCell<String>,
+        #[property(get, set, name = "last-message")]
+        pub last_message: RefCell<String>,
+        #[property(get, set, name = "unread-count")]
+        pub unread_count: Cell<i32>,
+        #[property(get, set)]
+        pub order: Cell<i64>,
+    }
+
+    #[glib::object_subclass]
+    impl ObjectSubclass for ChatObject {
+        const NAME: &'static str = "PalomaChatObject";
+        type Type = super::ChatObject;
+    }
+
+    #[glib::derived_properties]
+    impl ObjectImpl for ChatObject {}
+}
+
+glib::wrapper! {
+    pub struct ChatObject(ObjectSubclass<imp::ChatObject>);
+}
+
+impl ChatObject {
+    /// Construct an empty [`ChatObject`] carrying only its immutable `id`.
+    pub fn new(id: i64) -> Self {
+        glib::Object::builder().property("id", id).build()
+    }
+
+    /// Build a fully-populated [`ChatObject`] from a TDLib [`types::Chat`].
+    ///
+    /// The sort `order` is taken from the chat's position in the **Main** chat
+    /// list (falling back to `0` if the chat has no Main-list position).
+    pub fn from_chat(chat: &types::Chat) -> Self {
+        let obj = Self::new(chat.id);
+        obj.set_title(chat.title.clone());
+        obj.set_unread_count(chat.unread_count);
+        obj.set_order(main_list_order(&chat.positions));
+        obj.set_last_message(
+            chat.last_message
+                .as_ref()
+                .map(message_preview)
+                .unwrap_or_default(),
+        );
+        obj
+    }
+}
+
+/// Extract the Main-list sort order from a chat's positions, or `0` if none.
+fn main_list_order(positions: &[types::ChatPosition]) -> i64 {
+    positions
+        .iter()
+        .find(|p| matches!(p.list, ChatList::Main))
+        .map(|p| p.order)
+        .unwrap_or(0)
+}
+
+/// Render a short, single-line preview of a message for the chat list.
+///
+/// Text messages show their body; non-text content is summarised with a bracketed
+/// placeholder (e.g. `[Photo]`). Kept public so the update pump can reuse it when
+/// a `ChatLastMessage` update arrives.
+pub fn message_preview(msg: &types::Message) -> String {
+    match &msg.content {
+        MessageContent::MessageText(t) => t.text.text.clone(),
+        MessageContent::MessagePhoto(_) => "[Photo]".to_string(),
+        MessageContent::MessageVideo(_) => "[Video]".to_string(),
+        MessageContent::MessageSticker(_) => "[Sticker]".to_string(),
+        MessageContent::MessageDocument(_) => "[Document]".to_string(),
+        _ => "[Media]".to_string(),
+    }
+}
