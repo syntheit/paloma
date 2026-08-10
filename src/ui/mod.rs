@@ -63,6 +63,13 @@ const APP_CSS: &str = "
 .msg-time {
     font-size: 0.72em;
 }
+.msg-status {
+    font-size: 0.72em;
+    opacity: 0.7;
+}
+.msg-out .msg-status {
+    color: alpha(@accent_fg_color, 0.8);
+}
 .msg-compose {
     background-color: @view_bg_color;
 }

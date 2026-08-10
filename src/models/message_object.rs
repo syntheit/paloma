@@ -69,6 +69,31 @@ pub mod kind {
     pub const OTHER: i32 = 6;
 }
 
+/// Discriminant constants for the `send-status` property. Only meaningful on
+/// OUTGOING messages. Mirrors paper-plane's sending-state model (pending vs.
+/// sent-not-read vs. read-by-recipient).
+pub mod send_status {
+    /// Sending / not yet confirmed by the server (or failed) — clock glyph.
+    pub const PENDING: i32 = 0;
+    /// Confirmed sent by the server, not yet read by the recipient — single check.
+    pub const SENT: i32 = 1;
+    /// Read by the recipient (message id <= chat.last_read_outbox_message_id) —
+    /// double check.
+    pub const READ: i32 = 2;
+}
+
+/// The indicator glyph for a `send-status` discriminant: a clock for pending, a
+/// single check for sent, a double check for read. Anything unexpected renders
+/// as empty.
+pub fn send_status_glyph(status: i32) -> &'static str {
+    match status {
+        send_status::PENDING => "\u{1F550}", // 🕐 clock
+        send_status::SENT => "\u{2713}",     // ✓ single check
+        send_status::READ => "\u{2713}\u{2713}", // ✓✓ double check
+        _ => "",
+    }
+}
+
 mod imp {
     use super::*;
     use std::cell::{Cell, RefCell};
@@ -143,6 +168,17 @@ mod imp {
         /// only), or 0 for initials. Filled by the view once the user resolves.
         #[property(get, set, name = "avatar-file-id")]
         pub avatar_file_id: Cell<i32>,
+
+        /// Send/read status for OUTGOING messages, flattened to an i32
+        /// discriminant (see [`super::send_status`]): 0 = pending (clock),
+        /// 1 = sent (single check), 2 = read (double check). Meaningless for
+        /// incoming messages (they are not rendered with an indicator).
+        ///
+        /// [`super::MessageObject::apply`] sets pending vs. sent from the TDLib
+        /// `sending_state`; the chat view promotes sent → read when the chat's
+        /// `last_read_outbox_message_id` advances past this message's id.
+        #[property(get, set, name = "send-status")]
+        pub send_status: Cell<i32>,
     }
 
     #[glib::object_subclass]
@@ -188,10 +224,20 @@ impl MessageObject {
         self.set_sender_id(sender_id_of(&msg.sender_id));
         self.set_is_outgoing(msg.is_outgoing);
         self.set_date(i64::from(msg.date));
-        self.set_is_pending(matches!(
+        let pending = matches!(
             msg.sending_state,
             Some(MessageSendingState::Pending(_)) | Some(MessageSendingState::Failed(_))
-        ));
+        );
+        self.set_is_pending(pending);
+        // Sent/read indicator (outgoing only; ignored by the view for incoming).
+        // Pending/failed → clock. Server-confirmed → "sent"; the view promotes
+        // it to "read" once the chat's last_read_outbox_message_id passes this
+        // message's id. Don't clobber an already-"read" state set by the view.
+        if pending {
+            self.set_send_status(send_status::PENDING);
+        } else if self.send_status() != send_status::READ {
+            self.set_send_status(send_status::SENT);
+        }
         self.set_reply_to_id(reply_to_id_of(&msg.reply_to));
         self.apply_content(&msg.content);
     }

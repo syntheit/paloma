@@ -47,7 +47,7 @@ use tdlib_rs::enums::{
 use tdlib_rs::functions;
 use tdlib_rs::types::{FormattedText, InputMessageReplyToMessage, InputMessageText};
 
-use crate::models::message_object::kind;
+use crate::models::message_object::{kind, send_status, send_status_glyph};
 use crate::models::MessageObject;
 use crate::tdlib::{FileStore, TdClient};
 
@@ -100,6 +100,11 @@ struct Inner {
     /// Temporary (pending) message ids awaiting `MessageSendSucceeded`/`Failed`,
     /// used to dedup the `NewMessage` TDLib echoes for our own outgoing sends.
     temp_ids: RefCell<HashSet<i64>>,
+    /// The chat's `last_read_outbox_message_id` (from `get_chat` / kept fresh by
+    /// `updateChatReadOutbox`): every OUTGOING message with `id <=` this has been
+    /// read by the recipient. Drives the double-check indicator. `0` until the
+    /// first `get_chat` resolves.
+    last_read_outbox: Cell<i64>,
 }
 
 impl ChatView {
@@ -248,6 +253,7 @@ impl ChatView {
             reply_bar_text,
             sub_task: RefCell::new(None),
             temp_ids: RefCell::new(HashSet::new()),
+            last_read_outbox: Cell::new(0),
         });
 
         let this = ChatView {
@@ -311,6 +317,12 @@ impl ChatView {
                             | tdlib_rs::enums::ChatType::Supergroup(_)
                     );
                     this.inner.is_group.set(is_group);
+                    // Capture the recipient's read cursor so already-read
+                    // outgoing messages show a double-check on first paint.
+                    this.inner
+                        .last_read_outbox
+                        .set(chat.last_read_outbox_message_id);
+                    this.refresh_read_state(chat.last_read_outbox_message_id);
                     if is_group {
                         // Names weren't resolved while we thought this was a 1:1
                         // chat; resolve them now that we know it's a group.
@@ -624,6 +636,14 @@ impl ChatView {
                     self.remove_message(id);
                 }
             }
+            Update::ChatReadOutbox(u) if u.chat_id == self.inner.chat_id => {
+                // The recipient advanced their read cursor: promote every
+                // outgoing message at/under the new id to "read" (double check).
+                self.inner
+                    .last_read_outbox
+                    .set(u.last_read_outbox_message_id);
+                self.refresh_read_state(u.last_read_outbox_message_id);
+            }
             _ => {}
         }
     }
@@ -665,6 +685,26 @@ impl ChatView {
         let n = self.inner.store.n_items();
         if n > 0 {
             self.inner.store.items_changed(0, n, n);
+        }
+    }
+
+    /// Promote outgoing messages whose id is `<= last_read` to the "read"
+    /// (double-check) status. Only touches SENT rows — pending/failed rows keep
+    /// their clock, and messages already "read" are left alone. Mutating the
+    /// live `MessageObject`'s `send-status` fires `notify` and the per-row
+    /// property binding set up in `bind_row` updates the visible indicator, so
+    /// no `items_changed`/rebind is needed here.
+    fn refresh_read_state(&self, last_read: i64) {
+        if last_read == 0 {
+            return;
+        }
+        for obj in self.inner.index.borrow().values() {
+            if obj.is_outgoing()
+                && obj.id() <= last_read
+                && obj.send_status() == send_status::SENT
+            {
+                obj.set_send_status(send_status::READ);
+            }
         }
     }
 
@@ -1291,6 +1331,29 @@ impl ChatView {
 
 // --- Row factory helpers (free fns; the recycling factory captures no `self`) -
 
+// The GObject data key under which a row's live `send-status` → label binding is
+// stashed, so a recycled row can unbind the previous item's binding before it
+// binds the next one (avoiding the re-bind bug where a stale binding keeps
+// driving the label).
+const STATUS_BINDING_KEY: &str = "paloma-status-binding";
+
+/// Stash `binding` on `label`, unbinding+dropping any previously stashed one.
+fn store_status_binding(label: &gtk::Label, binding: glib::Binding) {
+    clear_status_binding(label);
+    unsafe {
+        label.set_data(STATUS_BINDING_KEY, binding);
+    }
+}
+
+/// Unbind and drop any binding previously stashed on `label`.
+fn clear_status_binding(label: &gtk::Label) {
+    unsafe {
+        if let Some(prev) = label.steal_data::<glib::Binding>(STATUS_BINDING_KEY) {
+            prev.unbind();
+        }
+    }
+}
+
 /// Build one recycled row: `[bubble{ reply, sender, body, photo, caption,
 /// time }]`. Widgets are named so `bind_row` can retrieve them.
 fn build_row(_: &gtk::SignalListItemFactory, list_item: &glib::Object) {
@@ -1368,12 +1431,32 @@ fn build_row(_: &gtk::SignalListItemFactory, list_item: &glib::Object) {
     body.set_widget_name("body");
     bubble.append(&body);
 
+    // Footer: timestamp + (outgoing only) the sent/read indicator, right-aligned.
+    let footer = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(3)
+        .halign(gtk::Align::End)
+        .build();
+    footer.set_widget_name("footer");
+
     let time = gtk::Label::builder()
         .css_classes(["msg-time", "dim-label"])
         .xalign(1.0)
         .build();
     time.set_widget_name("time");
-    bubble.append(&time);
+    footer.append(&time);
+
+    // Sent/read checkmark (hidden for incoming; text driven by a property
+    // binding to the item's `send-status` set up in `bind_row`).
+    let status = gtk::Label::builder()
+        .css_classes(["msg-status"])
+        .xalign(1.0)
+        .build();
+    status.set_widget_name("status");
+    status.set_visible(false);
+    footer.append(&status);
+
+    bubble.append(&footer);
 
     row.append(&bubble);
     list_item.set_child(Some(&row));
@@ -1503,6 +1586,29 @@ fn bind_row(list_item: &glib::Object, store: &gio::ListStore, files: &FileStore)
 
     if let Some(time) = find::<gtk::Label>(&root, "time") {
         time.set_text(&format_time(item.date()));
+    }
+
+    // Sent/read indicator: outgoing only. Drive its text via a property binding
+    // to `send-status` so it updates live when the chat view promotes the
+    // message to "read" (e.g. on updateChatReadOutbox) without an items_changed.
+    if let Some(status) = find::<gtk::Label>(&root, "status") {
+        // Tear down any binding left over from a previous item in this recycled
+        // row before (re)binding, so we never leave two bindings driving one
+        // label or a binding pointing at a stale MessageObject.
+        clear_status_binding(&status);
+        if outgoing {
+            status.set_visible(true);
+            status.set_text(send_status_glyph(item.send_status()));
+            let binding = item
+                .bind_property("send-status", &status, "label")
+                .transform_to(|_, status: i32| Some(send_status_glyph(status)))
+                .sync_create()
+                .build();
+            store_status_binding(&status, binding);
+        } else {
+            status.set_visible(false);
+            status.set_text("");
+        }
     }
 }
 
