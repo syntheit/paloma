@@ -230,9 +230,25 @@ impl ChatView {
         compose.append(&reply_bar);
         compose.append(&compose_row);
 
+        // Floating "scroll to newest" button overlaid on the history, shown when
+        // the user has scrolled up away from the bottom.
+        let overlay = gtk::Overlay::new();
+        overlay.set_child(Some(&scroller));
+        let scroll_down = gtk::Button::builder()
+            .icon_name("go-down-symbolic")
+            .css_classes(["osd", "circular"])
+            .halign(gtk::Align::End)
+            .valign(gtk::Align::End)
+            .margin_end(12)
+            .margin_bottom(12)
+            .tooltip_text("Scroll to latest")
+            .build();
+        scroll_down.set_visible(false);
+        overlay.add_overlay(&scroll_down);
+
         // History fills the space; compose bar pinned at the bottom.
         let toolbar = adw::ToolbarView::new();
-        toolbar.set_content(Some(&scroller));
+        toolbar.set_content(Some(&overlay));
         toolbar.add_bottom_bar(&compose);
 
         let inner = Rc::new(Inner {
@@ -266,6 +282,7 @@ impl ChatView {
 
         this.wire_send(&send_button);
         this.wire_scroll_paging();
+        this.wire_scroll_button(&scroll_down);
         this.wire_row_menu();
         {
             let this2 = this.clone();
@@ -1360,6 +1377,28 @@ impl ChatView {
         });
     }
 
+    /// Wire the floating "scroll to newest" button: it clicks to the bottom and
+    /// hides itself whenever the history is already near the bottom.
+    fn wire_scroll_button(&self, button: &gtk::Button) {
+        // Click → jump to the newest message and hide the button.
+        let this = self.clone();
+        let btn = button.clone();
+        button.connect_clicked(move |_| {
+            this.scroll_to_bottom();
+            btn.set_visible(false);
+        });
+
+        // Toggle visibility from the scroll position: hidden within 200px of the
+        // bottom, shown otherwise. This is a second handler on the same
+        // vadjustment as `wire_scroll_paging` (multiple handlers are fine).
+        let btn = button.clone();
+        let vadj = self.inner.scroller.vadjustment();
+        vadj.connect_value_changed(move |adj| {
+            let distance = adj.upper() - (adj.value() + adj.page_size());
+            btn.set_visible(distance > 200.0);
+        });
+    }
+
     /// Scroll the history to the newest message.
     fn scroll_to_bottom(&self) {
         let store = self.inner.store.clone();
@@ -1427,13 +1466,32 @@ fn build_row(_: &gtk::SignalListItemFactory, list_item: &glib::Object) {
         .downcast_ref::<gtk::ListItem>()
         .expect("list item is a ListItem");
 
-    // Full-width row holding a single bubble; the bubble's own halign pushes it
-    // to one side.
+    // Outer vertical row: a full-width date separator (hidden by default) above
+    // the horizontal avatar+bubble line. `bind_row` stamps the message id onto
+    // THIS outer box (`msg-row-<id>`) for the context-menu gesture walk.
     let row = gtk::Box::builder()
-        .orientation(gtk::Orientation::Horizontal)
-        .spacing(6)
+        .orientation(gtk::Orientation::Vertical)
         .build();
     row.set_widget_name("msg-row");
+
+    // Date separator pill, centered, shown only on the first row of a new day.
+    let date_sep = gtk::Label::builder()
+        .css_classes(["msg-date-sep"])
+        .halign(gtk::Align::Center)
+        .build();
+    date_sep.set_widget_name("date-sep");
+    date_sep.set_visible(false);
+    row.append(&date_sep);
+
+    // Horizontal line holding the avatar slot and the bubble; the bubble's own
+    // halign pushes it to one side.
+    let hbox = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(6)
+        .hexpand(true)
+        .halign(gtk::Align::Fill)
+        .build();
+    hbox.set_widget_name("msg-hbox");
 
     // Avatar slot (left of the bubble). Only populated/visible for the last
     // message of an incoming same-sender run in a group chat; otherwise it
@@ -1443,7 +1501,7 @@ fn build_row(_: &gtk::SignalListItemFactory, list_item: &glib::Object) {
     let avatar = adw::Avatar::new(AVATAR_SIZE, None, true);
     avatar.set_widget_name("avatar");
     avatar.set_valign(gtk::Align::End);
-    row.append(&avatar);
+    hbox.append(&avatar);
 
     let bubble = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
@@ -1505,6 +1563,17 @@ fn build_row(_: &gtk::SignalListItemFactory, list_item: &glib::Object) {
         .max_width_chars(36)
         .build();
     body.set_widget_name("body");
+    // Open http/https links (rendered as markup in `bind_row`) in the default
+    // handler. Wired once here at setup, not per-bind, so recycling doesn't
+    // stack duplicate handlers.
+    body.connect_activate_link(|_label, uri| {
+        if let Err(e) =
+            gio::AppInfo::launch_default_for_uri(uri, None::<&gio::AppLaunchContext>)
+        {
+            tracing::warn!(uri = %uri, error = %e, "failed to open link");
+        }
+        glib::Propagation::Stop
+    });
     bubble.append(&body);
 
     // Footer: timestamp + (outgoing only) the sent/read indicator, right-aligned.
@@ -1534,7 +1603,8 @@ fn build_row(_: &gtk::SignalListItemFactory, list_item: &glib::Object) {
 
     bubble.append(&footer);
 
-    row.append(&bubble);
+    hbox.append(&bubble);
+    row.append(&hbox);
     list_item.set_child(Some(&row));
 }
 
@@ -1569,6 +1639,23 @@ fn bind_row(list_item: &glib::Object, store: &gio::ListStore, files: &FileStore)
     let is_last_of_run = !grouped_with(next.as_ref(), Some(&item));
 
     row.set_halign(gtk::Align::Fill);
+
+    // Date separator: shown on the first loaded row and whenever this message
+    // falls on a different local calendar day than the row above it. Recycled
+    // rows must reset to hidden, so we always set visibility explicitly here.
+    if let Some(sep) = find::<gtk::Label>(&root, "date-sep") {
+        let first_of_day = match prev.as_ref() {
+            None => true,
+            Some(p) => !same_local_day(p.date(), item.date()),
+        };
+        if first_of_day {
+            sep.set_text(&crate::format::date_separator(item.date()));
+            sep.set_visible(true);
+        } else {
+            sep.set_text("");
+            sep.set_visible(false);
+        }
+    }
 
     if let Some(bubble) = find::<gtk::Box>(&root, "bubble") {
         bubble.set_halign(if outgoing {
@@ -1729,6 +1816,8 @@ fn bind_row(list_item: &glib::Object, store: &gio::ListStore, files: &FileStore)
     }
 
     // Body text: for photos, show only a non-empty caption; else the text.
+    // Non-empty bodies render as markup with http/https URLs linkified; all
+    // non-URL text is markup-escaped so message content can't inject markup.
     if let Some(body) = find::<gtk::Label>(&root, "body") {
         let text = if kind == kind::PHOTO {
             item.media_caption()
@@ -1739,12 +1828,13 @@ fn bind_row(list_item: &glib::Object, store: &gio::ListStore, files: &FileStore)
             body.set_visible(false);
         } else {
             body.set_visible(true);
-            body.set_text(&text);
+            body.set_use_markup(true);
+            body.set_markup(&linkify(&text));
         }
     }
 
     if let Some(time) = find::<gtk::Label>(&root, "time") {
-        time.set_text(&format_time(item.date()));
+        time.set_text(&crate::format::message_time(item.date()));
     }
 
     // Sent/read indicator: outgoing only. Drive its text via a property binding
@@ -1832,12 +1922,66 @@ fn snippet(text: &str) -> String {
     }
 }
 
-/// Format a Unix timestamp (seconds) as a short local `HH:MM` label.
-fn format_time(unix: i64) -> String {
-    let dt = glib::DateTime::from_unix_local(unix)
-        .and_then(|d| d.format("%H:%M"))
-        .map(|s| s.to_string());
-    dt.unwrap_or_default()
+/// Whether two Unix timestamps (seconds) fall on the same local calendar day.
+fn same_local_day(a: i64, b: i64) -> bool {
+    match (
+        glib::DateTime::from_unix_local(a),
+        glib::DateTime::from_unix_local(b),
+    ) {
+        (Ok(a), Ok(b)) => {
+            a.year() == b.year()
+                && a.month() == b.month()
+                && a.day_of_month() == b.day_of_month()
+        }
+        _ => false,
+    }
+}
+
+/// Render `text` as Pango markup, turning `http://` / `https://` URLs into
+/// clickable `<a>` links. Every non-URL run and every URL is passed through
+/// `glib::markup_escape_text`, so arbitrary message text (including `<`, `&`,
+/// `>`) cannot inject markup.
+fn linkify(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let bytes = text.as_bytes();
+    let mut i = 0usize;
+    // Byte offset of the start of the current pending non-URL run.
+    let mut run_start = 0usize;
+
+    while i < text.len() {
+        let rest = &text[i..];
+        if rest.starts_with("http://") || rest.starts_with("https://") {
+            // Flush the escaped non-URL run before this URL.
+            if run_start < i {
+                out.push_str(&glib::markup_escape_text(&text[run_start..i]));
+            }
+            // A URL runs until the next ASCII whitespace.
+            let mut j = i;
+            while j < text.len() && !bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            let url = &text[i..j];
+            let esc = glib::markup_escape_text(url);
+            out.push_str("<a href=\"");
+            out.push_str(&esc);
+            out.push_str("\">");
+            out.push_str(&esc);
+            out.push_str("</a>");
+            i = j;
+            run_start = j;
+        } else {
+            // Advance one char (URLs only start at an ASCII 'h', so stepping by
+            // one byte here is safe — we never split inside a multibyte char
+            // because the next `starts_with` check re-anchors at a char start).
+            let ch_len = rest.chars().next().map(char::len_utf8).unwrap_or(1);
+            i += ch_len;
+        }
+    }
+    // Flush the trailing non-URL run.
+    if run_start < text.len() {
+        out.push_str(&glib::markup_escape_text(&text[run_start..]));
+    }
+    out
 }
 
 /// Depth-first search for the first descendant of `root` whose widget name is

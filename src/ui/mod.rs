@@ -63,6 +63,15 @@ const APP_CSS: &str = "
 .msg-time {
     font-size: 0.72em;
 }
+.msg-date-sep {
+    font-size: 0.8em;
+    padding: 2px 10px;
+    margin: 6px 0;
+    border-radius: 9999px;
+    background-color: alpha(@card_fg_color, 0.1);
+    color: @window_fg_color;
+    opacity: 0.85;
+}
 .msg-status {
     font-size: 0.72em;
     opacity: 0.7;
