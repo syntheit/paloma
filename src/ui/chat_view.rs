@@ -616,6 +616,10 @@ impl ChatView {
                 // The insert may end the previous run's grouping; rebind the
                 // affected window around the insertion point.
                 self.rebind_around(pos);
+                let aid = u.message.media_album_id;
+                if aid != 0 {
+                    self.rebind_album_run(aid);
+                }
                 self.scroll_to_bottom();
                 if !u.message.is_outgoing {
                     self.view_message(id);
@@ -635,11 +639,19 @@ impl ChatView {
                     let pos = self.insert_sorted(&obj);
                     self.inner.index.borrow_mut().insert(new_id, obj);
                     self.rebind_around(pos);
+                    let aid = u.message.media_album_id;
+                    if aid != 0 {
+                        self.rebind_album_run(aid);
+                    }
                 } else if !self.inner.index.borrow().contains_key(&new_id) {
                     let obj = MessageObject::from_message(&u.message);
                     let pos = self.insert_sorted(&obj);
                     self.inner.index.borrow_mut().insert(new_id, obj);
                     self.rebind_around(pos);
+                    let aid = u.message.media_album_id;
+                    if aid != 0 {
+                        self.rebind_album_run(aid);
+                    }
                 }
             }
             Update::MessageSendFailed(u) if u.message.chat_id == self.inner.chat_id => {
@@ -751,6 +763,32 @@ impl ChatView {
         let end = (pos + 1).min(n.saturating_sub(1));
         let count = end - start + 1;
         self.inner.store.items_changed(start, count, count);
+    }
+
+    /// Rebind every row of the album run with `album_id` so the album's first
+    /// row re-renders its grid to include a newly-arrived member. No-op for 0.
+    fn rebind_album_run(&self, album_id: i64) {
+        if album_id == 0 {
+            return;
+        }
+        let store = &self.inner.store;
+        let n = store.n_items();
+        let mut first: Option<u32> = None;
+        let mut last: u32 = 0;
+        for pos in 0..n {
+            if let Some(obj) = store.item(pos).and_downcast::<MessageObject>() {
+                if obj.media_album_id() == album_id {
+                    if first.is_none() {
+                        first = Some(pos);
+                    }
+                    last = pos;
+                }
+            }
+        }
+        if let Some(f) = first {
+            let count = last - f + 1;
+            store.items_changed(f, count, count);
+        }
     }
 
     /// Remove the first store row whose id matches `id` (index-map untouched).
@@ -1559,12 +1597,24 @@ fn build_row(_: &gtk::SignalListItemFactory, list_item: &glib::Object) {
     sender.set_widget_name("sender");
     bubble.append(&sender);
 
+    // Album (media-group) grid: renders 2+ grouped photos as a tiled grid on
+    // the first row of the album run. Hidden for single photos / non-photos.
+    let album_grid = gtk::Grid::builder()
+        .row_spacing(2)
+        .column_spacing(2)
+        .build();
+    album_grid.add_css_class("msg-album");
+    album_grid.set_widget_name("album-grid");
+    album_grid.set_visible(false);
+    bubble.append(&album_grid);
+
     // Photo (hidden unless the message is a photo).
     let picture = gtk::Picture::builder()
         .content_fit(gtk::ContentFit::Contain)
         .can_shrink(true)
         .build();
     picture.add_css_class("msg-photo");
+    picture.add_css_class("msg-photo-single");
     picture.set_widget_name("photo");
     picture.set_visible(false);
     bubble.append(&picture);
@@ -1648,10 +1698,73 @@ fn bind_row(list_item: &glib::Object, store: &gio::ListStore, files: &FileStore)
     let pos = list_item.position();
     let prev = neighbour(store, pos, -1);
     let next = neighbour(store, pos, 1);
+    let album_id = item.media_album_id();
+    // A later member of an album run: the previous row shares this album id.
+    let is_album_first = prev.as_ref().map(|p| p.media_album_id()) != Some(album_id);
+    // Find the last store position sharing this album id (contiguous run).
+    let run_end_pos = if album_id != 0 {
+        let n = store.n_items();
+        let mut end = pos;
+        let mut p = pos + 1;
+        while p < n {
+            match store.item(p).and_downcast::<MessageObject>() {
+                Some(m) if m.media_album_id() == album_id => {
+                    end = p;
+                    p += 1;
+                }
+                _ => break,
+            }
+        }
+        end
+    } else {
+        pos
+    };
+    // For grouping (sender/avatar) treat the whole album as one unit: the
+    // "next" row for grouping is the first row AFTER the album run.
+    let group_next = if album_id != 0 {
+        neighbour(store, run_end_pos, 1)
+    } else {
+        next.clone()
+    };
     let show_sender = !grouped_with(Some(&item), prev.as_ref());
-    // Last of a consecutive same-sender run: the row below is a different
-    // sender/direction (or there is none). The trailing avatar goes here.
-    let is_last_of_run = !grouped_with(next.as_ref(), Some(&item));
+    let is_last_of_run = !grouped_with(group_next.as_ref(), Some(&item));
+
+    // --- Recycle reset for album-toggled widgets (run on EVERY bind) --------
+    // hbox visible by default (later album members hide it below).
+    if let Some(hbox) = find::<gtk::Box>(&root, "msg-hbox") {
+        hbox.set_visible(true);
+    }
+    // Album grid cleared + hidden by default (album-first branch re-shows it).
+    if let Some(grid) = find::<gtk::Grid>(&root, "album-grid") {
+        while let Some(child) = grid.first_child() {
+            grid.remove(&child);
+        }
+        grid.set_visible(false);
+    }
+
+    // A later member of an album run renders nothing: its photo is drawn in the
+    // album-first row's grid. Collapse this row to zero height. (The row's
+    // widget-name stash above keeps the context menu working.)
+    if album_id != 0 && !is_album_first {
+        // Tear down any live property bindings from a previous item so a hidden
+        // label isn't driven by a stale binding.
+        if let Some(status) = find::<gtk::Label>(&root, "status") {
+            clear_status_binding(&status);
+        }
+        if let Some(sender) = find::<gtk::Label>(&root, "sender") {
+            clear_sender_binding(&sender);
+        }
+        // Hide the horizontal content line; also hide the date separator (the
+        // album's first member owns the date).
+        if let Some(hbox) = find::<gtk::Box>(&root, "msg-hbox") {
+            hbox.set_visible(false);
+        }
+        if let Some(sep) = find::<gtk::Label>(&root, "date-sep") {
+            sep.set_visible(false);
+            sep.set_text("");
+        }
+        return;
+    }
 
     row.set_halign(gtk::Align::Fill);
 
@@ -1793,14 +1906,88 @@ fn bind_row(list_item: &glib::Object, store: &gio::ListStore, files: &FileStore)
         }
     }
 
-    // Photo vs. text body.
+    // Photo / album grid vs. text body.
     let kind = item.kind();
-    if let Some(picture) = find_first::<gtk::Picture>(&root) {
-        if kind == kind::PHOTO {
+    // Locate the single picture by its stable css class (album cells carry a
+    // different class, so this never returns an album cell).
+    let single_pic = find_picture_with_css(&root, "msg-photo-single");
+
+    if album_id != 0 && is_album_first {
+        // Album-first row: render the whole run as a tiled grid.
+        // Hide the single picture.
+        if let Some(picture) = single_pic.as_ref() {
+            picture.set_visible(false);
+            picture.set_paintable(gtk::gdk::Paintable::NONE);
+            picture.set_size_request(-1, -1);
+        }
+        // Collect (file_id) for each photo member of the run, in order.
+        let mut cells: Vec<i32> = Vec::new();
+        let n = store.n_items();
+        let mut p = pos;
+        while p < n {
+            match store.item(p).and_downcast::<MessageObject>() {
+                Some(m) if m.media_album_id() == album_id => {
+                    if m.kind() == kind::PHOTO {
+                        cells.push(m.photo_file_id());
+                    }
+                    p += 1;
+                }
+                _ => break,
+            }
+        }
+        if let Some(grid) = find::<gtk::Grid>(&root, "album-grid") {
+            // (Grid was already cleared in the recycle reset above.)
+            let n_cells = cells.len();
+            let cols: usize = match n_cells {
+                0 | 1 => 1,
+                2 => 2,
+                3 => 3,
+                4 => 2,
+                _ => 3,
+            };
+            // Cell size so cols * cell + gaps <= ~320 px.
+            let cell = ((320 - (cols as i32 - 1) * 2) / cols as i32).max(60);
+            for (idx, &file_id) in cells.iter().enumerate() {
+                let pic = gtk::Picture::builder()
+                    .content_fit(gtk::ContentFit::Cover)
+                    .can_shrink(true)
+                    .build();
+                pic.add_css_class("msg-album-cell");
+                pic.set_widget_name(&format!("photo-{file_id}"));
+                pic.set_size_request(cell, cell);
+                let col = (idx % cols) as i32;
+                let rowi = (idx / cols) as i32;
+                grid.attach(&pic, col, rowi, 1, 1);
+                // Recycle-safe download/paint.
+                if let Some(path) = files.cached(file_id) {
+                    if let Ok(texture) = gtk::gdk::Texture::from_filename(&path) {
+                        pic.set_paintable(Some(&texture));
+                    }
+                } else {
+                    let want = item.id();
+                    let pic2 = pic.clone();
+                    let li = list_item.clone();
+                    files.download(file_id, 8, move |path| {
+                        if li.item().and_downcast::<MessageObject>().map(|m| m.id())
+                            != Some(want)
+                        {
+                            return;
+                        }
+                        if let Ok(texture) = gtk::gdk::Texture::from_filename(&path) {
+                            pic2.set_paintable(Some(&texture));
+                        }
+                    });
+                }
+            }
+            grid.set_visible(true);
+        }
+    } else if kind == kind::PHOTO {
+        // Single (non-album) photo — unchanged behaviour, only the lookup helper
+        // differs (find_picture_with_css instead of find_first).
+        if let Some(picture) = single_pic.as_ref() {
             picture.set_visible(true);
-            size_picture(&picture, item.photo_width(), item.photo_height());
+            size_picture(picture, item.photo_width(), item.photo_height());
             let file_id = item.photo_file_id();
-            // Stash the file id in the name so the tap handler can read it.
             picture.set_widget_name(&format!("photo-{file_id}"));
             picture.set_paintable(gtk::gdk::Paintable::NONE);
             if let Some(path) = files.cached(file_id) {
@@ -1812,8 +1999,6 @@ fn bind_row(list_item: &glib::Object, store: &gio::ListStore, files: &FileStore)
                 let picture2 = picture.clone();
                 let li = list_item.clone();
                 files.download(file_id, 8, move |path| {
-                    // Guard against recycling: only paint if this row still
-                    // holds the item we started the download for.
                     if li.item().and_downcast::<MessageObject>().map(|m| m.id()) != Some(want) {
                         return;
                     }
@@ -1822,7 +2007,10 @@ fn bind_row(list_item: &glib::Object, store: &gio::ListStore, files: &FileStore)
                     }
                 });
             }
-        } else {
+        }
+    } else {
+        // Not a photo: hide + reset the single picture.
+        if let Some(picture) = single_pic.as_ref() {
             picture.set_visible(false);
             picture.set_paintable(gtk::gdk::Paintable::NONE);
             picture.set_size_request(-1, -1);
@@ -1834,7 +2022,26 @@ fn bind_row(list_item: &glib::Object, store: &gio::ListStore, files: &FileStore)
     // Non-empty bodies render as markup with http/https URLs linkified; all
     // non-URL text is markup-escaped so message content can't inject markup.
     if let Some(body) = find::<gtk::Label>(&root, "body") {
-        let text = if kind == kind::PHOTO {
+        let text = if album_id != 0 && is_album_first {
+            // Album caption: first non-empty media_caption in the run.
+            let mut cap = String::new();
+            let n = store.n_items();
+            let mut p = pos;
+            while p < n {
+                match store.item(p).and_downcast::<MessageObject>() {
+                    Some(m) if m.media_album_id() == album_id => {
+                        let c = m.media_caption();
+                        if !c.is_empty() {
+                            cap = c;
+                            break;
+                        }
+                        p += 1;
+                    }
+                    _ => break,
+                }
+            }
+            cap
+        } else if kind == kind::PHOTO {
             item.media_caption()
         } else {
             item.content_text()
@@ -2020,6 +2227,7 @@ fn find<T: IsA<gtk::Widget>>(root: &gtk::Widget, name: &str) -> Option<T> {
 /// Depth-first search for the first descendant of `root` that downcasts to `T`,
 /// ignoring widget names. Used for the row's single [`gtk::Picture`], whose name
 /// carries a per-bind file id rather than a stable lookup key.
+#[allow(dead_code)]
 fn find_first<T: IsA<gtk::Widget>>(root: &gtk::Widget) -> Option<T> {
     let mut child = root.first_child();
     while let Some(c) = child {
@@ -2027,6 +2235,23 @@ fn find_first<T: IsA<gtk::Widget>>(root: &gtk::Widget) -> Option<T> {
             return Some(w);
         }
         if let Some(found) = find_first::<T>(&c) {
+            return Some(found);
+        }
+        child = c.next_sibling();
+    }
+    None
+}
+
+/// First descendant Picture carrying `css` as a style class.
+fn find_picture_with_css(root: &gtk::Widget, css: &str) -> Option<gtk::Picture> {
+    let mut child = root.first_child();
+    while let Some(c) = child {
+        if let Ok(p) = c.clone().downcast::<gtk::Picture>() {
+            if p.has_css_class(css) {
+                return Some(p);
+            }
+        }
+        if let Some(found) = find_picture_with_css(&c, css) {
             return Some(found);
         }
         child = c.next_sibling();

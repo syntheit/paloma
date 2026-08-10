@@ -179,6 +179,9 @@ mod imp {
         /// `last_read_outbox_message_id` advances past this message's id.
         #[property(get, set, name = "send-status")]
         pub send_status: Cell<i32>,
+        /// The album/media-group id this message belongs to (0 if not part of an album).
+        #[property(get, set, name = "media-album-id")]
+        pub media_album_id: Cell<i64>,
     }
 
     #[glib::object_subclass]
@@ -224,6 +227,7 @@ impl MessageObject {
         self.set_sender_id(sender_id_of(&msg.sender_id));
         self.set_is_outgoing(msg.is_outgoing);
         self.set_date(i64::from(msg.date));
+        self.set_media_album_id(msg.media_album_id);
         let pending = matches!(
             msg.sending_state,
             Some(MessageSendingState::Pending(_)) | Some(MessageSendingState::Failed(_))

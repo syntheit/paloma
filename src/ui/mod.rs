@@ -137,6 +137,16 @@ const APP_CSS: &str = "
 .image-viewer {
     background-color: @window_bg_color;
 }
+/* --- Album (media-group) grid --- */
+.msg-album {
+    border-radius: 12px;
+    margin: 1px 0;
+    overflow: hidden;
+}
+.msg-album-cell {
+    border-radius: 2px;
+    background-color: alpha(@card_fg_color, 0.06);
+}
 ";
 
 /// Install the app stylesheet. Call once at application startup.
