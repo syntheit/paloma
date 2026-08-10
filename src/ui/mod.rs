@@ -187,6 +187,32 @@ avatar.avatar-color-6 { background: #cd4073; color: #ffffff; }
     font-size: 0.72em;
     min-width: 34px;
 }
+
+/* --- Voice recording (compose bar) --- */
+.msg-mic {
+    min-width: 32px;
+    min-height: 32px;
+    padding: 0;
+}
+.msg-recording {
+    padding: 6px 8px;
+}
+.rec-dot {
+    min-width: 10px;
+    min-height: 10px;
+    border-radius: 9999px;
+    background: #e01b24;
+    animation: rec-pulse 1.5s ease-in-out infinite;
+}
+@keyframes rec-pulse {
+    0%   { opacity: 1; }
+    50%  { opacity: 0.3; }
+    100% { opacity: 1; }
+}
+.rec-timer {
+    font-size: 0.95em;
+    min-width: 48px;
+}
 ";
 
 /// Install the app stylesheet. Call once at application startup.

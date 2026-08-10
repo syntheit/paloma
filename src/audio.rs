@@ -257,3 +257,123 @@ fn clear_owner(inner: &Rc<Inner>) {
 pub fn file_uri(path: &std::path::Path) -> Option<String> {
     glib::filename_to_uri(path, None).ok().map(|g| g.to_string())
 }
+
+/// A cheaply-cloneable single-slot voice-note recorder.
+///
+/// Captures the default mic to a temp OGG/Opus file via a GStreamer pipeline.
+/// The OGG muxer MUST be flushed by pushing EOS and waiting for it to propagate
+/// *before* setting the pipeline to Null; otherwise the OGG is truncated and
+/// invalid. A missing or unavailable microphone makes [`VoiceRecorder::start`]
+/// return `Err` rather than panicking, so the caller can fall back gracefully.
+#[derive(Clone)]
+pub struct VoiceRecorder {
+    inner: Rc<RecInner>,
+}
+
+struct RecInner {
+    pipeline: RefCell<Option<gst::Pipeline>>,
+    path: RefCell<Option<std::path::PathBuf>>,
+    started: Cell<Option<std::time::Instant>>,
+}
+
+impl VoiceRecorder {
+    /// Build an idle recorder (initializes GStreamer once for the process).
+    pub fn new() -> Self {
+        ensure_init();
+        Self {
+            inner: Rc::new(RecInner {
+                pipeline: RefCell::new(None),
+                path: RefCell::new(None),
+                started: Cell::new(None),
+            }),
+        }
+    }
+
+    /// Start capturing to a fresh temp OGG/Opus file. Returns `Err` (leaving the
+    /// recorder idle) if the pipeline can't be built or started — e.g. no mic.
+    pub fn start(&self) -> Result<(), String> {
+        let dir = dirs::cache_dir().unwrap_or_else(std::env::temp_dir);
+        let millis = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let filename = format!("paloma-voice-{millis}.ogg");
+        let path = dir.join(filename);
+        let description = format!(
+            "autoaudiosrc ! audioconvert ! audioresample ! opusenc ! oggmux ! filesink location=\"{}\"",
+            path.display()
+        );
+
+        use gst::prelude::*;
+        let element = gst::parse::launch(&description).map_err(|e| e.to_string())?;
+        let pipeline = element
+            .dynamic_cast::<gst::Pipeline>()
+            .map_err(|_| "not a pipeline".to_string())?;
+        pipeline
+            .set_state(gst::State::Playing)
+            .map_err(|e| e.to_string())?;
+
+        *self.inner.pipeline.borrow_mut() = Some(pipeline);
+        *self.inner.path.borrow_mut() = Some(path);
+        self.inner.started.set(Some(std::time::Instant::now()));
+        Ok(())
+    }
+
+    /// Elapsed recording time in whole seconds (a minimum of 1 while recording,
+    /// 0 when idle).
+    pub fn duration_secs(&self) -> i32 {
+        self.inner
+            .started
+            .get()
+            .map(|t| {
+                let s = t.elapsed().as_secs();
+                if s == 0 { 1 } else { s as i32 }
+            })
+            .unwrap_or(0)
+    }
+
+    /// Whether a recording is currently in progress.
+    #[allow(dead_code)]
+    pub fn is_recording(&self) -> bool {
+        self.inner.pipeline.borrow().is_some()
+    }
+
+    /// Stop and finalize the recording, returning the file path and its duration
+    /// in seconds. Flushes the muxer via EOS-then-wait before tearing down so the
+    /// OGG is valid. Returns `None` if not recording.
+    pub fn stop(&self) -> Option<(std::path::PathBuf, i32)> {
+        use gst::prelude::*;
+        let pipeline = self.inner.pipeline.borrow_mut().take()?;
+        let duration = self.duration_secs();
+        let bus = pipeline.bus();
+        let _ = pipeline.send_event(gst::event::Eos::new());
+        if let Some(bus) = bus {
+            let _ = bus.timed_pop_filtered(
+                gst::ClockTime::from_seconds(3),
+                &[gst::MessageType::Eos, gst::MessageType::Error],
+            );
+        }
+        let _ = pipeline.set_state(gst::State::Null);
+        let path = self.inner.path.borrow_mut().take();
+        self.inner.started.set(None);
+        path.map(|p| (p, duration))
+    }
+
+    /// Abort the recording and delete the temp file, leaving the recorder idle.
+    pub fn cancel(&self) {
+        use gst::prelude::*;
+        if let Some(pipeline) = self.inner.pipeline.borrow_mut().take() {
+            let _ = pipeline.set_state(gst::State::Null);
+        }
+        if let Some(path) = self.inner.path.borrow_mut().take() {
+            let _ = std::fs::remove_file(&path);
+        }
+        self.inner.started.set(None);
+    }
+}
+
+impl Default for VoiceRecorder {
+    fn default() -> Self {
+        Self::new()
+    }
+}

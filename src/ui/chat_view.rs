@@ -41,16 +41,19 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use tdlib_rs::enums::{
-    InputMessageContent, InputMessageReplyTo, Message as MessageEnum, MessageProperties as MessagePropsEnum,
-    Messages, MessageSender, Update, User as UserEnum,
+    InputFile, InputMessageContent, InputMessageReplyTo, Message as MessageEnum,
+    MessageProperties as MessagePropsEnum, Messages, MessageSender, Update, User as UserEnum,
 };
 use tdlib_rs::functions;
-use tdlib_rs::types::{FormattedText, InputMessageReplyToMessage, InputMessageText};
+use tdlib_rs::types::{
+    FormattedText, InputFileLocal, InputMessageReplyToMessage, InputMessageText,
+    InputMessageVoiceNote,
+};
 
 use crate::models::message_object::{kind, send_status, send_status_glyph};
 use crate::models::MessageObject;
 use crate::tdlib::{FileStore, TdClient};
-use crate::audio::{file_uri, VoiceEvent, VoicePlayer};
+use crate::audio::{file_uri, VoiceEvent, VoicePlayer, VoiceRecorder};
 
 /// Messages sent within this many seconds of each other by the same sender are
 /// visually grouped (name hidden, one trailing avatar).
@@ -76,6 +79,22 @@ struct Inner {
     files: FileStore,
     /// Shared single-stream voice-note player (one playback at a time).
     voice: VoicePlayer,
+    /// Single-slot voice-note recorder for the compose bar.
+    recorder: VoiceRecorder,
+    /// True while a voice note is actively being recorded.
+    recording: Cell<bool>,
+    /// Source id of the 1s recording-timer tick, cleared when recording ends.
+    rec_timer_id: RefCell<Option<glib::SourceId>>,
+    /// The normal compose row (entry + send/mic), hidden while recording.
+    compose_row: gtk::Box,
+    /// The recording row (dot + timer + discard/send), shown while recording.
+    recording_row: gtk::Box,
+    /// Mic button in the compose row's trailing slot (shown when entry empty).
+    mic_button: gtk::Button,
+    /// Send button in the compose row's trailing slot (shown when entry has text).
+    send_button: gtk::Button,
+    /// Elapsed M:SS label shown in the recording row.
+    rec_timer_label: gtk::Label,
     chat_id: i64,
     /// Our own user id, resolved lazily via `get_me`, to distinguish grouping.
     me_id: Cell<i64>,
@@ -230,6 +249,13 @@ impl ChatView {
             .tooltip_text("Send")
             .build();
 
+        let mic_button = gtk::Button::builder()
+            .icon_name("audio-input-microphone-symbolic")
+            .valign(gtk::Align::End)
+            .css_classes(["circular", "flat", "msg-mic"])
+            .tooltip_text("Record voice message")
+            .build();
+
         let compose_row = gtk::Box::builder()
             .orientation(gtk::Orientation::Horizontal)
             .spacing(8)
@@ -240,6 +266,48 @@ impl ChatView {
             .build();
         compose_row.append(&entry_scroll);
         compose_row.append(&send_button);
+        compose_row.append(&mic_button);
+        send_button.set_visible(false);
+        mic_button.set_visible(true);
+
+        // Recording row (hidden until the mic button starts a recording).
+        let rec_dot = gtk::Box::builder()
+            .css_classes(["rec-dot"])
+            .valign(gtk::Align::Center)
+            .build();
+        let rec_timer_label = gtk::Label::builder()
+            .css_classes(["rec-timer"])
+            .label("0:00")
+            .xalign(0.0)
+            .hexpand(true)
+            .valign(gtk::Align::Center)
+            .build();
+        let rec_cancel = gtk::Button::builder()
+            .icon_name("edit-delete-symbolic")
+            .valign(gtk::Align::Center)
+            .css_classes(["circular", "flat"])
+            .tooltip_text("Discard")
+            .build();
+        let rec_send = gtk::Button::builder()
+            .icon_name("document-send-symbolic")
+            .valign(gtk::Align::Center)
+            .css_classes(["circular", "suggested-action"])
+            .tooltip_text("Send voice message")
+            .build();
+        let recording_row = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(8)
+            .margin_top(6)
+            .margin_bottom(6)
+            .margin_start(8)
+            .margin_end(8)
+            .build();
+        recording_row.add_css_class("msg-recording");
+        recording_row.append(&rec_dot);
+        recording_row.append(&rec_timer_label);
+        recording_row.append(&rec_cancel);
+        recording_row.append(&rec_send);
+        recording_row.set_visible(false);
 
         // Reply strip stacked above the compose row.
         let compose = gtk::Box::builder()
@@ -248,6 +316,7 @@ impl ChatView {
         compose.add_css_class("msg-compose");
         compose.append(&reply_bar);
         compose.append(&compose_row);
+        compose.append(&recording_row);
 
         // Floating "scroll to newest" button overlaid on the history, shown when
         // the user has scrolled up away from the bottom.
@@ -282,6 +351,14 @@ impl ChatView {
             client,
             files,
             voice,
+            recorder: VoiceRecorder::new(),
+            recording: Cell::new(false),
+            rec_timer_id: RefCell::new(None),
+            compose_row: compose_row.clone(),
+            recording_row: recording_row.clone(),
+            mic_button: mic_button.clone(),
+            send_button: send_button.clone(),
+            rec_timer_label: rec_timer_label.clone(),
             chat_id,
             me_id: Cell::new(0),
             is_group: Cell::new(false),
@@ -313,6 +390,8 @@ impl ChatView {
 
         this.wire_send(&send_button);
         this.wire_typing_send();
+        this.wire_compose_toggle();
+        this.wire_voice_record(&mic_button, &rec_send, &rec_cancel);
         this.wire_scroll_paging();
         this.wire_scroll_button(&scroll_down);
         this.wire_row_menu();
@@ -1220,19 +1299,152 @@ impl ChatView {
                     // The returned message already carries a temporary id and a
                     // Pending sending_state, so this IS the single optimistic
                     // insert; `from_message` sets is_pending() from that state.
-                    let id = msg.id;
-                    if !this.inner.index.borrow().contains_key(&id) {
-                        let obj = MessageObject::from_message(&msg);
-                        this.inner.temp_ids.borrow_mut().insert(id);
-                        let pos = this.insert_sorted(&obj);
-                        this.inner.index.borrow_mut().insert(id, obj);
-                        this.resolve_replies(&[id]);
-                        this.rebind_around(pos);
-                        this.scroll_to_bottom();
-                    }
+                    this.append_sent(&msg);
                 }
                 Err(e) => {
                     tracing::warn!(code = e.code, msg = %e.message, "send_message failed");
+                }
+            },
+        );
+    }
+
+    /// Optimistically append a just-sent message row (dedup-guarded by id).
+    fn append_sent(&self, msg: &tdlib_rs::types::Message) {
+        let id = msg.id;
+        if !self.inner.index.borrow().contains_key(&id) {
+            let obj = MessageObject::from_message(msg);
+            self.inner.temp_ids.borrow_mut().insert(id);
+            let pos = self.insert_sorted(&obj);
+            self.inner.index.borrow_mut().insert(id, obj);
+            self.resolve_replies(&[id]);
+            self.rebind_around(pos);
+            self.scroll_to_bottom();
+        }
+    }
+
+    /// Toggle the trailing compose slot between the send and mic buttons based on
+    /// whether the entry holds any non-whitespace text. Separate from the typing
+    /// signal so it also fires on clears.
+    fn wire_compose_toggle(&self) {
+        let this = self.clone();
+        let buffer = self.inner.entry.buffer();
+        buffer.connect_changed(move |buf| {
+            // Don't flip the trailing slot while recording (recording_row owns it).
+            if this.inner.recording.get() {
+                return;
+            }
+            let (s, e) = buf.bounds();
+            let has_text = !buf.text(&s, &e, false).trim().is_empty();
+            this.inner.send_button.set_visible(has_text);
+            this.inner.mic_button.set_visible(!has_text);
+        });
+    }
+
+    /// Wire the mic button (start) and the recording-row send/discard buttons.
+    fn wire_voice_record(&self, mic_button: &gtk::Button, rec_send: &gtk::Button, rec_cancel: &gtk::Button) {
+        let this = self.clone();
+        mic_button.connect_clicked(move |_| this.start_recording());
+        let this = self.clone();
+        rec_send.connect_clicked(move |_| this.send_recording());
+        let this = self.clone();
+        rec_cancel.connect_clicked(move |_| this.cancel_recording());
+    }
+
+    /// Begin capturing a voice note: swap the compose row for the recording row
+    /// and tick an elapsed timer once a second. No-op if the mic is unavailable.
+    fn start_recording(&self) {
+        if self.inner.recording.get() {
+            return;
+        }
+        if let Err(e) = self.inner.recorder.start() {
+            tracing::warn!(error = %e, "voice recording unavailable (mic?)");
+            return;
+        }
+        self.inner.recording.set(true);
+        self.inner.compose_row.set_visible(false);
+        self.inner.recording_row.set_visible(true);
+        self.inner.rec_timer_label.set_text("0:00");
+
+        // Tick the M:SS elapsed label once a second while recording.
+        let this = self.clone();
+        let id = glib::timeout_add_seconds_local(1, move || {
+            if !this.inner.recording.get() {
+                return glib::ControlFlow::Break;
+            }
+            let secs = this.inner.recorder.duration_secs();
+            this.inner.rec_timer_label.set_text(&format!("{}:{:02}", secs / 60, secs % 60));
+            glib::ControlFlow::Continue
+        });
+        *self.inner.rec_timer_id.borrow_mut() = Some(id);
+    }
+
+    /// Reset the compose UI after a recording ends (shared by send + cancel).
+    fn stop_rec_ui(&self) {
+        if let Some(id) = self.inner.rec_timer_id.borrow_mut().take() {
+            id.remove();
+        }
+        self.inner.recording.set(false);
+        self.inner.recording_row.set_visible(false);
+        self.inner.compose_row.set_visible(true);
+        self.inner.rec_timer_label.set_text("0:00");
+        // Restore the trailing-slot state per the (now-idle) entry contents.
+        let buffer = self.inner.entry.buffer();
+        let (s, e) = buffer.bounds();
+        let has_text = !buffer.text(&s, &e, false).trim().is_empty();
+        self.inner.send_button.set_visible(has_text);
+        self.inner.mic_button.set_visible(!has_text);
+    }
+
+    /// Discard the in-progress recording (deletes the temp file) and reset the UI.
+    fn cancel_recording(&self) {
+        self.inner.recorder.cancel();
+        self.stop_rec_ui();
+        // Keep any armed reply intact — canceling a recording must not drop it.
+    }
+
+    /// Finalize the recording and send it as a voice note, threading any armed
+    /// reply. Optimistically appends the returned pending message.
+    fn send_recording(&self) {
+        let recorded = self.inner.recorder.stop();
+        self.stop_rec_ui();
+        let (path, duration) = match recorded {
+            Some(v) => v,
+            None => return,
+        };
+        let path_string = path.to_string_lossy().into_owned();
+
+        let cid = self.inner.client.client_id();
+        let chat_id = self.inner.chat_id;
+        let content = InputMessageContent::InputMessageVoiceNote(InputMessageVoiceNote {
+            voice_note: InputFile::Local(InputFileLocal { path: path_string }),
+            duration,
+            waveform: String::new(),
+            caption: None,
+            self_destruct_type: None,
+        });
+
+        // Thread the armed reply (if any), then disarm the reply strip.
+        let reply = self.inner.reply_to.get();
+        let reply_to = if reply != 0 {
+            Some(InputMessageReplyTo::Message(InputMessageReplyToMessage {
+                message_id: reply,
+                quote: None,
+                checklist_task_id: 0,
+            }))
+        } else {
+            None
+        };
+        self.clear_reply();
+
+        let this = self.clone();
+        crate::runtime::spawn(
+            async move {
+                functions::send_message(chat_id, None, reply_to, None, content, cid).await
+            },
+            move |res| match res {
+                Ok(MessageEnum::Message(msg)) => this.append_sent(&msg),
+                Err(e) => {
+                    tracing::warn!(code = e.code, msg = %e.message, "send_message (voice) failed");
                 }
             },
         );
