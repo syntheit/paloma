@@ -58,6 +58,10 @@ const GROUP_WINDOW_SECS: i64 = 300;
 /// Pixel size of the per-message sender avatar shown in group chats.
 const AVATAR_SIZE: i32 = 30;
 
+/// Number of deterministic avatar placeholder colors (see `.avatar-color-N` in
+/// the app stylesheet). Keyed per-user so a sender's color never flips.
+const AVATAR_COLOR_COUNT: i64 = 7;
+
 /// The message-history component for a single chat. Cheap to `.clone()` — the
 /// widget tree and all state live behind the shared `Rc<Inner>`.
 #[derive(Clone)]
@@ -93,6 +97,9 @@ struct Inner {
     list_view: gtk::ListView,
     scroller: gtk::ScrolledWindow,
     entry: gtk::TextView,
+    /// The chat's header title/subtitle. Title is the chat name (set by app.rs
+    /// via `set_title`); subtitle carries the live "typing…" status.
+    header_title: adw::WindowTitle,
     /// Reply-preview strip shown above the compose entry while replying.
     reply_bar: gtk::Revealer,
     reply_bar_name: gtk::Label,
@@ -108,6 +115,13 @@ struct Inner {
     /// read by the recipient. Drives the double-check indicator. `0` until the
     /// first `get_chat` resolves.
     last_read_outbox: Cell<i64>,
+    /// Unix seconds of the last `send_chat_action(Typing)` we sent, to throttle
+    /// the outgoing typing cadence to ~one signal per 5s. `0` before any send.
+    last_typing_sent: Cell<i64>,
+    /// Generation counter for the typing-clear timeout: each incoming Typing
+    /// action bumps it and arms a fresh 6s clear; only the latest-armed timeout
+    /// actually clears, so a refreshing peer never prematurely blanks the status.
+    typing_gen: Cell<u64>,
 }
 
 impl ChatView {
@@ -248,6 +262,14 @@ impl ChatView {
 
         // History fills the space; compose bar pinned at the bottom.
         let toolbar = adw::ToolbarView::new();
+
+        // Own header: a WindowTitle whose title is the chat name (set by app.rs)
+        // and whose subtitle carries the live "typing…" status.
+        let header_title = adw::WindowTitle::new("", "");
+        let header = adw::HeaderBar::new();
+        header.set_title_widget(Some(&header_title));
+        toolbar.add_top_bar(&header);
+
         toolbar.set_content(Some(&overlay));
         toolbar.add_bottom_bar(&compose);
 
@@ -267,12 +289,15 @@ impl ChatView {
             list_view,
             scroller,
             entry,
+            header_title,
             reply_bar,
             reply_bar_name,
             reply_bar_text,
             sub_task: RefCell::new(None),
             temp_ids: RefCell::new(HashSet::new()),
             last_read_outbox: Cell::new(0),
+            last_typing_sent: Cell::new(0),
+            typing_gen: Cell::new(0),
         });
 
         let this = ChatView {
@@ -281,6 +306,7 @@ impl ChatView {
         };
 
         this.wire_send(&send_button);
+        this.wire_typing_send();
         this.wire_scroll_paging();
         this.wire_scroll_button(&scroll_down);
         this.wire_row_menu();
@@ -299,6 +325,12 @@ impl ChatView {
     /// The id of the chat this view renders.
     pub fn chat_id(&self) -> i64 {
         self.inner.chat_id
+    }
+
+    /// Set the chat title shown in this view's header (subtitle is managed
+    /// internally by the typing-indicator logic).
+    pub fn set_title(&self, title: &str) {
+        self.inner.header_title.set_title(title);
     }
 
     /// Begin streaming: `open_chat`, resolve our own id, subscribe to updates,
@@ -688,8 +720,70 @@ impl ChatView {
                     .set(u.last_read_outbox_message_id);
                 self.refresh_read_state(u.last_read_outbox_message_id);
             }
+            Update::ChatAction(u) if u.chat_id == self.inner.chat_id => {
+                self.handle_chat_action(u);
+            }
             _ => {}
         }
+    }
+
+    /// Update the header subtitle from a peer's typing action in the open chat.
+    /// Ignores our own actions; clears on Cancel or after a ~6s idle timeout.
+    fn handle_chat_action(&self, u: tdlib_rs::types::UpdateChatAction) {
+        // Ignore our own typing echo.
+        let sender_id = match &u.sender_id {
+            MessageSender::User(s) => s.user_id,
+            MessageSender::Chat(_) => return,
+        };
+        if sender_id == self.inner.me_id.get() {
+            return;
+        }
+        match u.action {
+            tdlib_rs::enums::ChatAction::Typing => {
+                let subtitle = if self.inner.is_group.get() {
+                    let name = self
+                        .inner
+                        .names
+                        .borrow()
+                        .get(&sender_id)
+                        .cloned()
+                        .unwrap_or_default();
+                    // Resolve the name if unknown so a later refresh can label it.
+                    if name.is_empty() {
+                        self.resolve_names(vec![sender_id]);
+                        "typing…".to_string()
+                    } else {
+                        format!("{name} is typing…")
+                    }
+                } else {
+                    "typing…".to_string()
+                };
+                self.set_typing_subtitle(&subtitle);
+                // Arm a self-cancelling 6s clear: bump the generation, and only the
+                // latest armed timeout actually clears (a refresh bumps it again).
+                let gen = self.inner.typing_gen.get().wrapping_add(1);
+                self.inner.typing_gen.set(gen);
+                let this = self.clone();
+                glib::timeout_add_seconds_local_once(6, move || {
+                    if this.inner.typing_gen.get() == gen {
+                        this.set_typing_subtitle("");
+                    }
+                });
+            }
+            tdlib_rs::enums::ChatAction::Cancel => {
+                // Invalidate any pending clear timeout and clear now.
+                self.inner
+                    .typing_gen
+                    .set(self.inner.typing_gen.get().wrapping_add(1));
+                self.set_typing_subtitle("");
+            }
+            _ => {}
+        }
+    }
+
+    /// Set the header's live subtitle (empty string hides the typing status).
+    fn set_typing_subtitle(&self, subtitle: &str) {
+        self.inner.header_title.set_subtitle(subtitle);
     }
 
     /// Remove a message row by id, if present.
@@ -1134,6 +1228,44 @@ impl ChatView {
                 }
             },
         );
+    }
+
+    /// Throttle-send a Typing chat action while the user edits the compose entry.
+    /// Telegram's own cadence is ~every 5s; we gate on wall-clock seconds.
+    fn wire_typing_send(&self) {
+        let this = self.clone();
+        let buffer = self.inner.entry.buffer();
+        buffer.connect_changed(move |buf| {
+            // Only signal typing when there's actual text (ignore clears on send).
+            let (s, e) = buf.bounds();
+            if buf.text(&s, &e, false).trim().is_empty() {
+                return;
+            }
+            let now = glib::real_time() / 1_000_000; // micros -> seconds
+            let last = this.inner.last_typing_sent.get();
+            if now - last < 5 {
+                return;
+            }
+            this.inner.last_typing_sent.set(now);
+            let cid = this.inner.client.client_id();
+            let chat_id = this.inner.chat_id;
+            crate::runtime::spawn(
+                async move {
+                    functions::send_chat_action(
+                        chat_id,
+                        None,
+                        Some(tdlib_rs::enums::ChatAction::Typing),
+                        cid,
+                    )
+                    .await
+                },
+                |res| {
+                    if let Err(e) = res {
+                        tracing::warn!(code = e.code, msg = %e.message, "send_chat_action failed");
+                    }
+                },
+            );
+        });
     }
 
     /// Arm the compose reply-strip to reply to `message_id`.
@@ -1862,7 +1994,15 @@ fn bind_row(list_item: &glib::Object, store: &gio::ListStore, files: &FileStore)
         // never for outgoing. In groups the initials fallback uses the sender
         // name; in 1:1 the name is empty and adw::Avatar falls back to a generic
         // person icon, which is fine.
+        // Recycled rows may carry a stale color class; always drop it first so
+        // exactly one (or, for outgoing, none) is present after this bind.
+        clear_avatar_color(&avatar);
         if !outgoing {
+            // Deterministic placeholder color, keyed on the sender id so a given
+            // user's color never flips across binds (AdwAvatar's own text-hash
+            // color is unstable because our avatar `text` changes per message).
+            let idx = item.sender_id().rem_euclid(AVATAR_COLOR_COUNT);
+            avatar.add_css_class(&format!("avatar-color-{idx}"));
             // Reserve the slot on every incoming row.
             avatar.set_size(AVATAR_SIZE);
             avatar.set_show_initials(true);
@@ -2119,6 +2259,13 @@ fn size_picture(picture: &gtk::Picture, width: i32, height: i32) {
     let w = (width as f64 * scale).round() as i32;
     let h = (height as f64 * scale).round() as i32;
     picture.set_size_request(w.max(1), h.max(1));
+}
+
+/// Remove any previously-applied `avatar-color-*` class from `avatar`.
+fn clear_avatar_color(avatar: &adw::Avatar) {
+    for i in 0..AVATAR_COLOR_COUNT {
+        avatar.remove_css_class(&format!("avatar-color-{i}"));
+    }
 }
 
 /// Combine first/last name into a single display string.

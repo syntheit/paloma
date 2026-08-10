@@ -301,60 +301,14 @@ fn main_page(client: &TdClient) -> adw::NavigationPage {
             }
 
             let view = ChatView::new(client.clone(), chat_id);
-            let header = adw::HeaderBar::new();
+            // The ChatView owns its header (title + live typing subtitle), so we
+            // just hand it the chat name and embed its root directly.
+            view.set_title(if title.is_empty() { "Chat" } else { &title });
 
-            // Chat avatar at the start of the header: initials now, photo once
-            // downloaded. Fetched via get_chat since the row only handed us the
-            // id + title.
-            let avatar = adw::Avatar::new(28, Some(&title), true);
-            header.pack_start(&avatar);
-            {
-                let files = client.files();
-                let cid = client.client_id();
-                let avatar = avatar.clone();
-                let current = current.clone();
-                crate::runtime::spawn(
-                    async move {
-                        use tdlib_rs::enums::Chat;
-                        match tdlib_rs::functions::get_chat(chat_id, cid).await {
-                            Ok(Chat::Chat(c)) => c.photo.as_ref().map(|p| p.small.id).unwrap_or(0),
-                            Err(_) => 0,
-                        }
-                    },
-                    move |file_id| {
-                        if file_id == 0 {
-                            return;
-                        }
-                        let apply = {
-                            let avatar = avatar.clone();
-                            let current = current.clone();
-                            move |path: std::path::PathBuf| {
-                                // Discard a late photo for a chat the user already switched away from.
-                                let still_current =
-                                    current.borrow().as_ref().map(|v| v.chat_id()) == Some(chat_id);
-                                if !still_current {
-                                    return;
-                                }
-                                if let Ok(texture) = gtk::gdk::Texture::from_filename(&path) {
-                                    avatar.set_custom_image(Some(&texture));
-                                }
-                            }
-                        };
-                        if let Some(path) = files.cached(file_id) {
-                            apply(path);
-                        } else {
-                            files.download(file_id, 16, apply);
-                        }
-                    },
-                );
-            }
-
-            let toolbar = adw::ToolbarView::builder().content(view.widget()).build();
-            toolbar.add_top_bar(&header);
             let page = adw::NavigationPage::builder()
                 .title(if title.is_empty() { "Chat" } else { &title })
                 .tag("content")
-                .child(&toolbar)
+                .child(view.widget())
                 .build();
             split.set_content(Some(&page));
             split.set_show_content(true);
