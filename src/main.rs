@@ -4,6 +4,7 @@
 //! and hands off to [`app::build_ui`].
 
 mod app;
+mod audio;
 mod config;
 mod format;
 mod models;

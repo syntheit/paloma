@@ -30,8 +30,9 @@ pub enum MessageKind {
     Photo { file_id: i32, width: i32, height: i32 },
     /// A document/file: `file_id`, original name, size in bytes.
     Document { file_id: i32, name: String, size: i64 },
-    /// A voice note of `duration` seconds.
-    Voice { duration: i32 },
+    /// A voice note: `file_id` of the OGG/Opus blob, `duration` seconds, and the
+    /// raw 5-bit `waveform` string (may be empty).
+    Voice { file_id: i32, duration: i32, waveform: String },
     /// A sticker (rendered as a placeholder this wave).
     Sticker,
     /// A video (placeholder this wave).
@@ -151,6 +152,12 @@ mod imp {
         /// Document size in bytes (kind == Document).
         #[property(get, set, name = "doc-size")]
         pub doc_size: Cell<i64>,
+        /// Voice-note `file_id` (kind == Voice), else 0.
+        #[property(get, set, name = "voice-file-id")]
+        pub voice_file_id: Cell<i32>,
+        /// Voice-note duration in seconds (kind == Voice), else 0.
+        #[property(get, set, name = "voice-duration")]
+        pub voice_duration: Cell<i32>,
 
         // --- Reply-to (a message in the same chat) ---------------------------
         /// Replied-to message id, or 0 if this message is not a reply (or the
@@ -264,6 +271,8 @@ impl MessageObject {
         self.set_doc_file_id(0);
         self.set_doc_name(String::new());
         self.set_doc_size(0);
+        self.set_voice_file_id(0);
+        self.set_voice_duration(0);
         self.set_media_caption(String::new());
         match &kind {
             MessageKind::Photo { file_id, width, height } => {
@@ -277,6 +286,10 @@ impl MessageObject {
                 self.set_doc_name(name.clone());
                 self.set_doc_size(*size);
                 self.set_media_caption(caption_of(content));
+            }
+            MessageKind::Voice { file_id, duration, .. } => {
+                self.set_voice_file_id(*file_id);
+                self.set_voice_duration(*duration);
             }
             _ => {}
         }
@@ -335,7 +348,9 @@ pub fn parse_kind(content: &MessageContent) -> MessageKind {
             size: d.document.document.size,
         },
         MessageContent::MessageVoiceNote(v) => MessageKind::Voice {
+            file_id: v.voice_note.voice.id,
             duration: v.voice_note.duration,
+            waveform: v.voice_note.waveform.clone(),
         },
         MessageContent::MessageSticker(_) => MessageKind::Sticker,
         MessageContent::MessageVideo(_) | MessageContent::MessageVideoNote(_) => MessageKind::Video,
@@ -408,7 +423,7 @@ pub fn format_size(bytes: i64) -> String {
 }
 
 /// Format a seconds duration as `M:SS`.
-fn format_duration(secs: i32) -> String {
+pub fn format_duration(secs: i32) -> String {
     let s = secs.max(0);
     format!("{}:{:02}", s / 60, s % 60)
 }

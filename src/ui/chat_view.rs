@@ -50,6 +50,7 @@ use tdlib_rs::types::{FormattedText, InputMessageReplyToMessage, InputMessageTex
 use crate::models::message_object::{kind, send_status, send_status_glyph};
 use crate::models::MessageObject;
 use crate::tdlib::{FileStore, TdClient};
+use crate::audio::{file_uri, VoiceEvent, VoicePlayer};
 
 /// Messages sent within this many seconds of each other by the same sender are
 /// visually grouped (name hidden, one trailing avatar).
@@ -73,6 +74,8 @@ pub struct ChatView {
 struct Inner {
     client: TdClient,
     files: FileStore,
+    /// Shared single-stream voice-note player (one playback at a time).
+    voice: VoicePlayer,
     chat_id: i64,
     /// Our own user id, resolved lazily via `get_me`, to distinguish grouping.
     me_id: Cell<i64>,
@@ -130,6 +133,7 @@ impl ChatView {
     pub fn new(client: TdClient, chat_id: i64) -> Self {
         let files = client.files();
         let store = gio::ListStore::new::<MessageObject>();
+        let voice = VoicePlayer::new();
 
         // --- Row factory: one recycled row per visible slot. -----------------
         let factory = gtk::SignalListItemFactory::new();
@@ -137,8 +141,9 @@ impl ChatView {
 
         let this_store = store.clone();
         let bind_files = files.clone();
+        let bind_voice = voice.clone();
         factory.connect_bind(move |_, list_item| {
-            bind_row(list_item, &this_store, &bind_files);
+            bind_row(list_item, &this_store, &bind_files, &bind_voice);
         });
 
         let selection = gtk::NoSelection::new(Some(store.clone()));
@@ -276,6 +281,7 @@ impl ChatView {
         let inner = Rc::new(Inner {
             client,
             files,
+            voice,
             chat_id,
             me_id: Cell::new(0),
             is_group: Cell::new(false),
@@ -402,6 +408,8 @@ impl ChatView {
 
     /// Stop streaming for this chat. Call when the view is popped/replaced.
     pub fn close(&self) {
+        // Halt any in-progress voice playback so switching chats stops audio.
+        self.inner.voice.stop();
         // Abort the update loop so it drops its receiver and the strong
         // `ChatView` it holds — otherwise this view leaks on every chat switch.
         if let Some(handle) = self.inner.sub_task.borrow_mut().take() {
@@ -1644,6 +1652,27 @@ fn clear_sender_binding(label: &gtk::Label) {
     }
 }
 
+/// Data key under which a voice row stashes its current `VoicePlayer` playback
+/// token, so a recycled row can stop the stale stream it previously started.
+const VOICE_TOKEN_KEY: &str = "paloma-voice-token";
+/// Data key under which the voice play/pause button stashes its current click
+/// `SignalHandlerId`, disconnected before a rebind installs a fresh handler.
+const VOICE_CLICK_KEY: &str = "paloma-voice-click";
+/// Data key under which the voice scale stashes its current `change-value`
+/// `SignalHandlerId`, disconnected before a rebind installs a fresh handler.
+const VOICE_SEEK_KEY: &str = "paloma-voice-seek";
+
+/// Stash the current playback token on the voice box (replacing any prior one).
+fn set_voice_token(vbox: &gtk::Box, token: u64) {
+    unsafe {
+        vbox.set_data(VOICE_TOKEN_KEY, token);
+    }
+}
+/// Take (remove) the stashed playback token off the voice box, if any.
+fn take_voice_token(vbox: &gtk::Box) -> Option<u64> {
+    unsafe { vbox.steal_data::<u64>(VOICE_TOKEN_KEY) }
+}
+
 /// Build one recycled row: `[bubble{ reply, sender, body, photo, caption,
 /// time }]`. Widgets are named so `bind_row` can retrieve them.
 fn build_row(_: &gtk::SignalListItemFactory, list_item: &glib::Object) {
@@ -1751,6 +1780,45 @@ fn build_row(_: &gtk::SignalListItemFactory, list_item: &glib::Object) {
     picture.set_visible(false);
     bubble.append(&picture);
 
+    // Voice-note player row (hidden unless the message is a voice note): a
+    // play/pause toggle, a seekable progress scale, and an M:SS time label.
+    let voice_box = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(8)
+        .build();
+    voice_box.add_css_class("msg-voice");
+    voice_box.set_widget_name("voice");
+    voice_box.set_visible(false);
+
+    let voice_play = gtk::Button::builder()
+        .icon_name("media-playback-start-symbolic")
+        .css_classes(["circular", "flat", "msg-voice-btn"])
+        .valign(gtk::Align::Center)
+        .build();
+    voice_play.set_widget_name("voice-play");
+    voice_box.append(&voice_play);
+
+    let voice_scale = gtk::Scale::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .hexpand(true)
+        .draw_value(false)
+        .valign(gtk::Align::Center)
+        .width_request(120)
+        .build();
+    voice_scale.add_css_class("msg-voice-scale");
+    voice_scale.set_widget_name("voice-scale");
+    voice_scale.set_range(0.0, 1.0);
+    voice_box.append(&voice_scale);
+
+    let voice_time = gtk::Label::builder()
+        .css_classes(["msg-voice-time", "dim-label"])
+        .valign(gtk::Align::Center)
+        .build();
+    voice_time.set_widget_name("voice-time");
+    voice_box.append(&voice_time);
+
+    bubble.append(&voice_box);
+
     let body = gtk::Label::builder()
         .css_classes(["msg-body"])
         .xalign(0.0)
@@ -1807,7 +1875,7 @@ fn build_row(_: &gtk::SignalListItemFactory, list_item: &glib::Object) {
 
 /// Bind a [`MessageObject`] onto a recycled row, computing grouping from the
 /// neighbouring rows in `store` and resolving media via `files`.
-fn bind_row(list_item: &glib::Object, store: &gio::ListStore, files: &FileStore) {
+fn bind_row(list_item: &glib::Object, store: &gio::ListStore, files: &FileStore, voice: &VoicePlayer) {
     let list_item = list_item
         .downcast_ref::<gtk::ListItem>()
         .expect("list item is a ListItem");
@@ -1872,6 +1940,19 @@ fn bind_row(list_item: &glib::Object, store: &gio::ListStore, files: &FileStore)
             grid.remove(&child);
         }
         grid.set_visible(false);
+    }
+
+    // Voice recycle reset: if this recycled row still holds a live playback
+    // token from the message it PREVIOUSLY showed, stop that stream (the row is
+    // about to show a different message) and clear the stashed token. Runs on
+    // every bind — including before the album early-return below — so scrolling
+    // a playing voice note off-screen halts audio.
+    if let Some(vbox) = find::<gtk::Box>(&root, "voice") {
+        if let Some(old) = take_voice_token(&vbox) {
+            voice.stop_if_owner(old);
+        }
+        // Default hidden; the Voice branch below re-shows + configures it.
+        vbox.set_visible(false);
     }
 
     // A later member of an album run renders nothing: its photo is drawn in the
@@ -2048,6 +2129,7 @@ fn bind_row(list_item: &glib::Object, store: &gio::ListStore, files: &FileStore)
 
     // Photo / album grid vs. text body.
     let kind = item.kind();
+    let is_voice = kind == kind::VOICE;
     // Locate the single picture by its stable css class (album cells carry a
     // different class, so this never returns an album cell).
     let single_pic = find_picture_with_css(&root, "msg-photo-single");
@@ -2158,11 +2240,40 @@ fn bind_row(list_item: &glib::Object, store: &gio::ListStore, files: &FileStore)
         }
     }
 
+    // Voice note: render the player controls; the generic body text is hidden.
+    if is_voice {
+        if let Some(vbox) = find::<gtk::Box>(&root, "voice") {
+            vbox.set_visible(true);
+            let duration = item.voice_duration().max(0);
+            let file_id = item.voice_file_id();
+
+            // Reset controls to a stopped state on (re)bind. The scale range is
+            // kept in SECONDS; a min of 1 avoids a zero-length range.
+            if let Some(scale) = find::<gtk::Scale>(&root, "voice-scale") {
+                scale.set_range(0.0, duration.max(1) as f64);
+                scale.set_value(0.0);
+            }
+            if let Some(tl) = find::<gtk::Label>(&root, "voice-time") {
+                tl.set_text(&crate::models::message_object::format_duration(duration));
+            }
+            if let Some(btn) = find::<gtk::Button>(&root, "voice-play") {
+                btn.set_icon_name("media-playback-start-symbolic");
+            }
+
+            // (Re)install fresh, recycle-safe click + seek handlers. Any handler
+            // left over from the previous item shown in this row is disconnected
+            // first (see wire_voice_controls).
+            wire_voice_controls(&root, list_item, voice, files, file_id, duration);
+        }
+    }
+
     // Body text: for photos, show only a non-empty caption; else the text.
     // Non-empty bodies render as markup with http/https URLs linkified; all
     // non-URL text is markup-escaped so message content can't inject markup.
     if let Some(body) = find::<gtk::Label>(&root, "body") {
-        let text = if album_id != 0 && is_album_first {
+        let text = if is_voice {
+            String::new()
+        } else if album_id != 0 && is_album_first {
             // Album caption: first non-empty media_caption in the run.
             let mut cap = String::new();
             let n = store.n_items();
@@ -2220,6 +2331,217 @@ fn bind_row(list_item: &glib::Object, store: &gio::ListStore, files: &FileStore)
             status.set_visible(false);
             status.set_text("");
         }
+    }
+}
+
+/// Wire the voice row's play/pause button and seekable scale, with recycle-safe
+/// handler teardown. Called on every bind of a voice message; it disconnects the
+/// previous item's click/seek handlers before installing fresh ones, and starts
+/// playback (from cache or after a download) on click, driving the button/scale/
+/// time-label from the [`VoicePlayer`]'s per-event callback.
+fn wire_voice_controls(
+    root: &gtk::Widget,
+    list_item: &gtk::ListItem,
+    voice: &VoicePlayer,
+    files: &FileStore,
+    file_id: i32,
+    duration: i32,
+) {
+    let _ = duration;
+    let btn = match find::<gtk::Button>(root, "voice-play") { Some(b) => b, None => return };
+    let scale = match find::<gtk::Scale>(root, "voice-scale") { Some(s) => s, None => return };
+    let time = match find::<gtk::Label>(root, "voice-time") { Some(t) => t, None => return };
+    let vbox = match find::<gtk::Box>(root, "voice") { Some(v) => v, None => return };
+
+    // Recycle guard: the item id this row currently shows. Async work (download)
+    // only applies if the row still shows this same message when it completes.
+    let want = list_item
+        .item()
+        .and_downcast::<MessageObject>()
+        .map(|m| m.id())
+        .unwrap_or(0);
+
+    // Per-widget drag guard, reused across binds so the (once-installed) drag
+    // gesture and the (re-installed each bind) change-value + event handlers all
+    // share the same flag. Get-or-create it on the scale.
+    let seeking: Rc<Cell<bool>> = unsafe {
+        match scale.data::<Rc<Cell<bool>>>("paloma-voice-seeking") {
+            Some(ptr) => ptr.as_ref().clone(),
+            None => {
+                let s = Rc::new(Cell::new(false));
+                scale.set_data("paloma-voice-seeking", s.clone());
+                s
+            }
+        }
+    };
+
+    // A single closure that, given the downloaded/cached local path, builds the
+    // uri, starts playback, stashes the returned token on the vbox, and wires an
+    // event callback that drives the button/scale/time widgets. Reused by the
+    // cached (sync) and download (async) paths below. Wrapped in an `Rc` so it
+    // can be cloned into both paths and called multiple times.
+    let start_playback = {
+        let voice = voice.clone();
+        let btn = btn.clone();
+        let scale = scale.clone();
+        let time = time.clone();
+        let vbox = vbox.clone();
+        let seeking = seeking.clone();
+        move |path: std::path::PathBuf| {
+            let uri = match file_uri(&path) {
+                Some(u) => u,
+                None => return,
+            };
+            // Clones captured by the per-event callback (Fn + 'static, runs on
+            // the main thread — the !Send widgets are fine here).
+            let btn_ev = btn.clone();
+            let scale_ev = scale.clone();
+            let time_ev = time.clone();
+            let vbox_ev = vbox.clone();
+            let seeking_ev = seeking.clone();
+            let token = voice.start(&uri, move |ev| match ev {
+                VoiceEvent::Duration(ns) => {
+                    let secs = (ns / 1_000_000_000) as i32;
+                    scale_ev.set_range(0.0, secs.max(1) as f64);
+                }
+                VoiceEvent::Position(ns) => {
+                    // Don't move the thumb while the user is dragging it.
+                    if !seeking_ev.get() {
+                        let secs_f = ns as f64 / 1_000_000_000.0;
+                        scale_ev.set_value(secs_f);
+                        time_ev.set_text(
+                            &crate::models::message_object::format_duration(secs_f as i32),
+                        );
+                    }
+                }
+                VoiceEvent::Playing(playing) => {
+                    btn_ev.set_icon_name(if playing {
+                        "media-playback-pause-symbolic"
+                    } else {
+                        "media-playback-start-symbolic"
+                    });
+                }
+                VoiceEvent::Ended => {
+                    // Reset the controls and drop the stashed token so a later
+                    // click starts a fresh playback rather than toggling a dead
+                    // stream. Safe to run here: the Ended callback only touches
+                    // widgets + the token stash, never voice.start/stop.
+                    btn_ev.set_icon_name("media-playback-start-symbolic");
+                    scale_ev.set_value(0.0);
+                    take_voice_token(&vbox_ev);
+                }
+            });
+            set_voice_token(&vbox, token);
+        }
+    };
+    let start_playback = Rc::new(start_playback);
+
+    // (Re)install the play/pause click handler, tearing down any handler left
+    // over from the previous item shown in this recycled row first.
+    unsafe {
+        if let Some(old) = btn.steal_data::<glib::SignalHandlerId>(VOICE_CLICK_KEY) {
+            btn.disconnect(old);
+        }
+    }
+    {
+        let voice = voice.clone();
+        let files = files.clone();
+        let vbox_click = vbox.clone();
+        let li = list_item.clone();
+        let start_playback = start_playback.clone();
+        let id = btn.connect_clicked(move |_| {
+            // If this row still owns a live stream, toggle it. Peek the stashed
+            // token without consuming it (steal then re-stash).
+            let stashed = take_voice_token(&vbox_click);
+            if let Some(token) = stashed {
+                if voice.is_owner(token) {
+                    set_voice_token(&vbox_click, token); // put it back
+                    voice.toggle(token);
+                    return;
+                }
+                // else: stale token from a finished/evicted stream; drop it.
+            }
+            // Start fresh. Resolve the file (cache hit → immediate; miss →
+            // download, recycle-guarded by the row's current item id).
+            if let Some(path) = files.cached(file_id) {
+                (start_playback)(path);
+            } else {
+                let li2 = li.clone();
+                let start_playback = start_playback.clone();
+                files.download(file_id, 16, move |path| {
+                    // Recycle guard: only start if this row still shows the same
+                    // message it did when the download was requested.
+                    if li2.item().and_downcast::<MessageObject>().map(|m| m.id()) != Some(want) {
+                        return;
+                    }
+                    (start_playback)(path);
+                });
+            }
+        });
+        unsafe {
+            btn.set_data(VOICE_CLICK_KEY, id);
+        }
+    }
+
+    // (Re)install the scale's change-value seek handler, tearing down the prior
+    // one first so a recycled scale doesn't fire the previous item's closure.
+    unsafe {
+        if let Some(old) = scale.steal_data::<glib::SignalHandlerId>(VOICE_SEEK_KEY) {
+            scale.disconnect(old);
+        }
+    }
+    {
+        let voice = voice.clone();
+        let vbox_seek = vbox.clone();
+        let seeking_change = seeking.clone();
+        let id = scale.connect_change_value(move |_scale, _scroll, value| {
+            // Only seek while the user is actively dragging (guard set by the
+            // press gesture); otherwise this fires from our own PositionUpdated
+            // `set_value` and would fight the pipeline.
+            if seeking_change.get() {
+                if let Some(token) = take_voice_token(&vbox_seek) {
+                    // Peek: put the token back, then seek if we still own it.
+                    set_voice_token(&vbox_seek, token);
+                    if voice.is_owner(token) {
+                        let ns = (value.max(0.0) * 1_000_000_000.0) as u64;
+                        voice.seek(token, ns);
+                    }
+                }
+            }
+            glib::Propagation::Proceed
+        });
+        unsafe {
+            scale.set_data(VOICE_SEEK_KEY, id);
+        }
+    }
+
+    // Install the drag-tracking gesture exactly once per recycled scale widget.
+    // It captures the per-widget `seeking` (stable across binds) so it keeps
+    // working after rebinds without stacking duplicate gestures.
+    let already_wired = unsafe { scale.data::<bool>("paloma-voice-drag").is_some() };
+    if !already_wired {
+        unsafe {
+            scale.set_data("paloma-voice-drag", true);
+        }
+        let press = gtk::GestureClick::new();
+        let seeking_press = seeking.clone();
+        press.connect_pressed(move |_, _, _, _| seeking_press.set(true));
+        let seeking_release = seeking.clone();
+        let voice_release = voice.clone();
+        let scale_release = scale.clone();
+        let vbox_release = vbox.clone();
+        press.connect_released(move |_, _, _, _| {
+            // Final seek to the released position, then release the guard.
+            if let Some(token) = take_voice_token(&vbox_release) {
+                set_voice_token(&vbox_release, token);
+                if voice_release.is_owner(token) {
+                    let ns = (scale_release.value().max(0.0) * 1_000_000_000.0) as u64;
+                    voice_release.seek(token, ns);
+                }
+            }
+            seeking_release.set(false);
+        });
+        scale.add_controller(press);
     }
 }
 

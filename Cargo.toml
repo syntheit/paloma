@@ -37,6 +37,12 @@ tdlib-rs = { version = "1.4", default-features = false, features = ["pkg-config"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
 async-channel = "2"
 
+# Audio playback for voice notes: a `gstplay::Play` pipeline decodes OGG/Opus
+# voice notes off the shared FileStore download. v1_20 ABI floor to match the
+# nixpkgs GStreamer; ogg/opus decode comes from gst-plugins-base/good at runtime.
+gstreamer = { version = "0.25", features = ["v1_20"] }
+gstreamer-play = "0.25"
+
 # Config: credentials.toml parsing + XDG dirs.
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"

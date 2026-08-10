@@ -158,6 +158,35 @@ avatar.avatar-color-3 { background: #4fad2d; color: #ffffff; }
 avatar.avatar-color-4 { background: #2996ad; color: #ffffff; }
 avatar.avatar-color-5 { background: #168acd; color: #ffffff; }
 avatar.avatar-color-6 { background: #cd4073; color: #ffffff; }
+
+/* --- Voice notes --- */
+.msg-voice {
+    min-width: 200px;
+    padding: 2px 0;
+}
+.msg-voice-btn {
+    min-width: 32px;
+    min-height: 32px;
+    padding: 0;
+}
+.msg-voice-scale {
+    padding: 0;
+}
+.msg-voice-scale trough {
+    min-height: 4px;
+    border-radius: 9999px;
+}
+.msg-voice-scale highlight {
+    border-radius: 9999px;
+    background-color: @accent_bg_color;
+}
+.msg-out .msg-voice-scale highlight {
+    background-color: @accent_fg_color;
+}
+.msg-voice-time {
+    font-size: 0.72em;
+    min-width: 34px;
+}
 ";
 
 /// Install the app stylesheet. Call once at application startup.

@@ -69,6 +69,16 @@
           tdlib
           openssl
           zlib
+          # GStreamer audio backend for voice-note playback. base+good carry the
+          # ogg demuxer + opus/vorbis decoders; bad+libav round out coverage for
+          # the audio/mpeg + audio/mp4 voice-note fallbacks TDLib may deliver.
+          # wrapGAppsHook4 exports GST_PLUGIN_SYSTEM_PATH from these so the
+          # `gstplay::Play` pipeline finds its plugins at runtime.
+          gst_all_1.gstreamer
+          gst_all_1.gst-plugins-base
+          gst_all_1.gst-plugins-good
+          gst_all_1.gst-plugins-bad
+          gst_all_1.gst-libav
         ];
 
         # tdlib-rs's `pkg-config` feature probes for `tdjson.pc`. pkg-config in
