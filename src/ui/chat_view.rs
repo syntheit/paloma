@@ -1354,6 +1354,28 @@ fn clear_status_binding(label: &gtk::Label) {
     }
 }
 
+/// The GObject data key under which a row's live `sender-name` → label binding is
+/// stashed, so a recycled row can unbind the previous item's binding before
+/// binding the next one (the same re-bind-safety pattern as the status binding).
+const SENDER_BINDING_KEY: &str = "paloma-sender-binding";
+
+/// Stash `binding` on `label`, unbinding+dropping any previously stashed one.
+fn store_sender_binding(label: &gtk::Label, binding: glib::Binding) {
+    clear_sender_binding(label);
+    unsafe {
+        label.set_data(SENDER_BINDING_KEY, binding);
+    }
+}
+
+/// Unbind and drop any sender binding previously stashed on `label`.
+fn clear_sender_binding(label: &gtk::Label) {
+    unsafe {
+        if let Some(prev) = label.steal_data::<glib::Binding>(SENDER_BINDING_KEY) {
+            prev.unbind();
+        }
+    }
+}
+
 /// Build one recycled row: `[bubble{ reply, sender, body, photo, caption,
 /// time }]`. Widgets are named so `bind_row` can retrieve them.
 fn build_row(_: &gtk::SignalListItemFactory, list_item: &glib::Object) {
@@ -1521,14 +1543,40 @@ fn bind_row(list_item: &glib::Object, store: &gio::ListStore, files: &FileStore)
         }
     }
 
-    // Sender name (incoming, has a name, first of a run).
+    // Sender name (incoming, groups only, first of a consecutive same-sender
+    // run). Driven by a property binding — like the status checkmark — so a
+    // name that resolves ASYNC (get_user after the row bound) repaints live
+    // without needing an items_changed. Recycled rows tear the old binding
+    // down first so they never cross-wire to a stale MessageObject.
     if let Some(sender) = find::<gtk::Label>(&root, "sender") {
+        clear_sender_binding(&sender);
         let name = item.sender_name();
-        if !outgoing && !name.is_empty() && show_sender {
+        // `sender-name` is only ever populated for INCOMING messages in GROUP
+        // chats (apply_sender_name/resolve_names early-return otherwise), so a
+        // non-empty name here already implies group+incoming. We still gate on
+        // !outgoing and the first-of-run flag so stacked messages hide it.
+        if !outgoing && show_sender && !name.is_empty() {
             sender.set_text(&name);
             sender.set_visible(true);
+            let binding = item
+                .bind_property("sender-name", &sender, "label")
+                .sync_create()
+                .build();
+            store_sender_binding(&sender, binding);
+        } else if !outgoing && show_sender {
+            // Group incoming, first-of-run, but the name hasn't resolved yet:
+            // keep the slot bound (and hidden) so the label repaints and shows
+            // the moment the async get_user lands, no scroll/rebind required.
+            sender.set_text("");
+            sender.set_visible(false);
+            let binding = item
+                .bind_property("sender-name", &sender, "label")
+                .sync_create()
+                .build();
+            store_sender_binding(&sender, binding);
         } else {
             sender.set_visible(false);
+            sender.set_text("");
         }
     }
 
