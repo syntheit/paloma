@@ -55,6 +55,9 @@ use crate::tdlib::{FileStore, TdClient};
 /// visually grouped (name hidden, one trailing avatar).
 const GROUP_WINDOW_SECS: i64 = 300;
 
+/// Pixel size of the per-message sender avatar shown in group chats.
+const AVATAR_SIZE: i32 = 30;
+
 /// The message-history component for a single chat. Cheap to `.clone()` — the
 /// widget tree and all state live behind the shared `Rc<Inner>`.
 #[derive(Clone)]
@@ -506,11 +509,23 @@ impl ChatView {
         self.resolve_replies(&inserted);
 
         if is_initial {
+            // The initial `get_chat` may have resolved BEFORE any messages were
+            // ingested, so its `refresh_read_state` ran over an empty index and
+            // promoted nothing. Now that the initial batch is in `self.index`,
+            // re-run it against the stored `last_read_outbox` cursor so already-
+            // read outgoing messages show a double-check on first paint. (The
+            // cursor is set by the get_chat callback independently of its own
+            // refresh, so it's populated even when that refresh found nothing.)
+            self.refresh_read_state(self.inner.last_read_outbox.get());
             // Grouping flags depend on neighbours; re-bind the whole loaded run.
             self.rebind_all();
             self.scroll_to_bottom();
             self.mark_visible_read(&ordered);
         } else {
+            // Older pages are almost always already read by the recipient;
+            // promote them now that they're in the index (the property binding
+            // repaints their indicator live, no extra rebind needed).
+            self.refresh_read_state(self.inner.last_read_outbox.get());
             // A prepend inserts a contiguous run at the top (positions
             // 0..inserted.len()). Re-bind only that run plus the one boundary
             // row below it — a full invalidate here fights scroll-restore.
@@ -797,7 +812,14 @@ impl ChatView {
                     if let Ok(UserEnum::User(user)) = res {
                         let name = display_name(&user.first_name, &user.last_name);
                         this.inner.names.borrow_mut().insert(uid, name.clone());
+                        // `profile_photo` is optional; `small` is the 160px avatar.
+                        let avatar_id = user
+                            .profile_photo
+                            .as_ref()
+                            .map(|p| p.small.id)
+                            .unwrap_or(0);
                         this.apply_name_to_rows(uid, &name);
+                        this.apply_avatar_to_rows(uid, avatar_id);
                     }
                 },
             );
@@ -818,6 +840,28 @@ impl ChatView {
                 if !obj.is_outgoing() && obj.sender_id() == uid {
                     if obj.sender_name().is_empty() {
                         obj.set_sender_name(name.to_string());
+                    }
+                    store.items_changed(pos, 1, 1);
+                }
+            }
+        }
+    }
+
+    /// After a user's avatar file id resolves, stamp it onto every already-
+    /// inserted incoming row by `uid` and re-bind those rows so the trailing
+    /// avatar of each same-sender run downloads and appears live.
+    fn apply_avatar_to_rows(&self, uid: i64, avatar_file_id: i32) {
+        // Avatars are only shown for incoming group messages.
+        if !self.inner.is_group.get() || avatar_file_id == 0 {
+            return;
+        }
+        let store = &self.inner.store;
+        let n = store.n_items();
+        for pos in 0..n {
+            if let Some(obj) = store.item(pos).and_downcast::<MessageObject>() {
+                if !obj.is_outgoing() && obj.sender_id() == uid {
+                    if obj.avatar_file_id() == 0 {
+                        obj.set_avatar_file_id(avatar_file_id);
                     }
                     store.items_changed(pos, 1, 1);
                 }
@@ -1391,6 +1435,16 @@ fn build_row(_: &gtk::SignalListItemFactory, list_item: &glib::Object) {
         .build();
     row.set_widget_name("msg-row");
 
+    // Avatar slot (left of the bubble). Only populated/visible for the last
+    // message of an incoming same-sender run in a group chat; otherwise it
+    // reserves its width (invisible) so bubbles stay left-aligned, or is fully
+    // hidden (width 0) for outgoing / 1:1 rows. `valign End` sits it at the
+    // bottom of the run, matching the official client.
+    let avatar = adw::Avatar::new(AVATAR_SIZE, None, true);
+    avatar.set_widget_name("avatar");
+    avatar.set_valign(gtk::Align::End);
+    row.append(&avatar);
+
     let bubble = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(2)
@@ -1508,7 +1562,11 @@ fn bind_row(list_item: &glib::Object, store: &gio::ListStore, files: &FileStore)
     // the store is already ascending-sorted by id === chronological).
     let pos = list_item.position();
     let prev = neighbour(store, pos, -1);
+    let next = neighbour(store, pos, 1);
     let show_sender = !grouped_with(Some(&item), prev.as_ref());
+    // Last of a consecutive same-sender run: the row below is a different
+    // sender/direction (or there is none). The trailing avatar goes here.
+    let is_last_of_run = !grouped_with(next.as_ref(), Some(&item));
 
     row.set_halign(gtk::Align::Fill);
 
@@ -1577,6 +1635,59 @@ fn bind_row(list_item: &glib::Object, store: &gio::ListStore, files: &FileStore)
         } else {
             sender.set_visible(false);
             sender.set_text("");
+        }
+    }
+
+    // Sender avatar (incoming, groups only). Shown only on the LAST row of a
+    // same-sender run; earlier rows of the run keep the slot but hide the image
+    // so bubbles stay left-aligned. Outgoing / 1:1 rows collapse the slot to 0.
+    if let Some(avatar) = find::<adw::Avatar>(&root, "avatar") {
+        let is_group = !item.sender_name().is_empty();
+        // A non-empty sender-name only ever occurs for incoming group messages
+        // (apply_sender_name/resolve_names early-return otherwise); combined with
+        // !outgoing this gates the avatar to incoming group rows exactly like the
+        // sender label above.
+        if !outgoing && is_group {
+            // Reserve the slot on every group-incoming row.
+            avatar.set_size(AVATAR_SIZE);
+            avatar.set_show_initials(true);
+            avatar.set_text(Some(&item.sender_name()));
+            avatar.set_custom_image(gtk::gdk::Paintable::NONE);
+            if is_last_of_run {
+                avatar.set_visible(true);
+                let file_id = item.avatar_file_id();
+                if file_id != 0 {
+                    if let Some(path) = files.cached(file_id) {
+                        if let Ok(texture) = gtk::gdk::Texture::from_filename(&path) {
+                            avatar.set_custom_image(Some(&texture));
+                        }
+                    } else {
+                        // Recycle-safe: only paint if this row still holds the
+                        // item we started the download for.
+                        let want = item.id();
+                        let avatar2 = avatar.clone();
+                        let li = list_item.clone();
+                        files.download(file_id, 12, move |path| {
+                            if li.item().and_downcast::<MessageObject>().map(|m| m.id())
+                                != Some(want)
+                            {
+                                return;
+                            }
+                            if let Ok(texture) = gtk::gdk::Texture::from_filename(&path) {
+                                avatar2.set_custom_image(Some(&texture));
+                            }
+                        });
+                    }
+                }
+            } else {
+                // Earlier row of a run: keep the width, hide the drawing.
+                avatar.set_visible(false);
+            }
+        } else {
+            // Outgoing or 1:1: collapse the slot entirely.
+            avatar.set_visible(false);
+            avatar.set_size(0);
+            avatar.set_custom_image(gtk::gdk::Paintable::NONE);
         }
     }
 

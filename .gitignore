@@ -17,3 +17,6 @@ Cargo.lock.orig
 
 # Telegram API credentials are passed as env vars at build time (see
 # secrets.nix.example). No secret files are ever committed.
+
+# agent worktrees
+.claude/
