@@ -11,12 +11,11 @@
 //! # Live updates
 //!
 //! Each chat keeps a single live `ChatObject` in [`Inner::index`] for O(1)
-//! mutation. When a TDLib update mutates an object, we call
-//! [`ChatList::notify_changed`] which fires `items_changed` on the store for
-//! that one row — the factory then re-binds *only* the affected visible slot.
-//! (We deliberately re-bind on demand rather than wire per-property GObject
-//! bindings in `connect_bind`, which would need per-row binding-lifetime
-//! bookkeeping; see the note in [`ChatList::new`].)
+//! mutation. Row widgets are wired to their `ChatObject` via GObject property
+//! bindings established in the factory's `connect_bind` (and torn down in
+//! `connect_unbind`), so mutating a setter (e.g. `set_last_message`) refreshes
+//! the visible row automatically — no manual re-bind needed. Order changes,
+//! which bindings can't express, still trigger a [`ChatList::resort`].
 
 use adw::prelude::*;
 use gtk::gio;
@@ -136,28 +135,35 @@ impl ChatList {
                 .item()
                 .and_downcast::<ChatObject>()
                 .expect("list item holds a ChatObject");
-            tracing::info!(
-                "SIDEBAR bind id={} title={:?} last_message={:?}",
-                item.id(),
-                item.title(),
-                item.last_message()
-            );
             let hbox = list_item
                 .child()
                 .and_downcast::<gtk::Box>()
                 .expect("row child is a Box");
             let root = hbox.upcast::<gtk::Widget>();
 
-            // We snapshot the object's current values into the recycled widgets
-            // here rather than establishing live GObject bindings: on any change
-            // the update pump calls `notify_changed`, which re-runs this bind
-            // for the affected slot. This keeps binding lifetimes trivial.
-            if let Some(avatar) = find::<adw::Avatar>(&root, "avatar") {
-                // Default: initials from the title, no custom image.
-                avatar.set_text(Some(&item.title()));
-                avatar.set_show_initials(true);
-                avatar.set_custom_image(gtk::gdk::Paintable::NONE);
+            // Wire the ChatObject's properties directly to the recycled row
+            // widgets with GObject property bindings. `sync_create()` pushes the
+            // current value immediately, and every later property notification
+            // (from `set_last_message`, `set_title`, `set_unread_count`, …)
+            // updates the widget automatically — independent of ListView re-bind
+            // timing. Each binding is stashed on the `ListItem` and unbound in
+            // `connect_unbind` so recycled rows don't accumulate or cross-wire.
+            let mut bindings: Vec<glib::Binding> = Vec::new();
 
+            if let Some(avatar) = find::<adw::Avatar>(&root, "avatar") {
+                // Initials come from the title; a custom image (below) overrides
+                // them when present.
+                avatar.set_show_initials(true);
+                bindings.push(
+                    item.bind_property("title", &avatar, "text")
+                        .sync_create()
+                        .build(),
+                );
+
+                // Reset any image left over from a previous binding of this
+                // recycled row; the download path re-applies it if this chat has
+                // one.
+                avatar.set_custom_image(gtk::gdk::Paintable::NONE);
                 let file_id = item.photo_file_id();
                 if file_id != 0 {
                     if let Some(path) = bind_files.cached(file_id) {
@@ -183,18 +189,62 @@ impl ChatList {
                 }
             }
             if let Some(title) = find::<gtk::Label>(&root, "title") {
-                title.set_text(&item.title());
+                bindings.push(
+                    item.bind_property("title", &title, "label")
+                        .sync_create()
+                        .build(),
+                );
             }
             if let Some(preview) = find::<gtk::Label>(&root, "preview") {
-                preview.set_text(&item.last_message());
+                bindings.push(
+                    item.bind_property("last-message", &preview, "label")
+                        .sync_create()
+                        .build(),
+                );
             }
             if let Some(badge) = find::<gtk::Label>(&root, "badge") {
-                let count = item.unread_count();
-                if count > 0 {
-                    badge.set_text(&count.to_string());
-                    badge.set_visible(true);
-                } else {
-                    badge.set_visible(false);
+                bindings.push(
+                    item.bind_property("unread-count", &badge, "label")
+                        .transform_to(|_, count: i32| {
+                            Some(if count > 0 {
+                                count.to_string()
+                            } else {
+                                String::new()
+                            })
+                        })
+                        .sync_create()
+                        .build(),
+                );
+                bindings.push(
+                    item.bind_property("unread-count", &badge, "visible")
+                        .transform_to(|_, count: i32| Some(count > 0))
+                        .sync_create()
+                        .build(),
+                );
+            }
+
+            // Stash the bindings on the ListItem so `connect_unbind` can unbind
+            // them when this slot is recycled onto a different chat.
+            unsafe {
+                list_item.set_data("paloma-bindings", bindings);
+            }
+        });
+
+        factory.connect_unbind(|_, list_item| {
+            let list_item = list_item
+                .downcast_ref::<gtk::ListItem>()
+                .expect("list item is a ListItem");
+            // Reclaim and drop the bindings established in `connect_bind`,
+            // calling `.unbind()` on each so the recycled widgets are no longer
+            // driven by the old chat's ChatObject. Without this, a row would
+            // stay wired to every chat it ever displayed and cross-wire updates.
+            unsafe {
+                if let Some(bindings) =
+                    list_item.steal_data::<Vec<glib::Binding>>("paloma-bindings")
+                {
+                    for binding in bindings {
+                        binding.unbind();
+                    }
                 }
             }
         });
@@ -311,12 +361,6 @@ impl ChatList {
 
         match update {
             Update::NewChat(u) => {
-                tracing::info!(
-                    "SIDEBAR NewChat id={} title={:?} last_some={}",
-                    u.chat.id,
-                    u.chat.title,
-                    u.chat.last_message.is_some()
-                );
                 let id = u.chat.id;
                 // Dedupe by id: ignore chats we already track.
                 if self.inner.index.borrow().contains_key(&id) {
@@ -329,13 +373,6 @@ impl ChatList {
                 self.resort();
             }
             Update::ChatLastMessage(u) => {
-                let in_index = self.inner.index.borrow().contains_key(&u.chat_id);
-                tracing::info!(
-                    "SIDEBAR ChatLastMessage id={} in_index={} last_some={}",
-                    u.chat_id,
-                    in_index,
-                    u.last_message.is_some()
-                );
                 let order = Self::main_order(&u.positions);
                 if let Some(obj) = self.inner.index.borrow().get(&u.chat_id) {
                     obj.set_last_message(
@@ -415,11 +452,9 @@ impl ChatList {
             },
             move |res| match res {
                 Ok(ids) => {
-                    tracing::info!("SIDEBAR initial_load: {} chat ids", ids.len());
                     this.hydrate_chats(ids);
                 }
-                Err(e) => {
-                    tracing::info!("SIDEBAR initial_load ERR {:?}", e);
+                Err(_e) => {
                     this.update_visibility();
                 }
             },
@@ -441,15 +476,7 @@ impl ChatList {
                 },
                 move |res| {
                     if let Some(chat) = res {
-                        tracing::info!(
-                            "SIDEBAR get_chat id={} title={:?} last_message_some={}",
-                            chat.id,
-                            chat.title,
-                            chat.last_message.is_some()
-                        );
                         this.add_or_update(chat);
-                    } else {
-                        tracing::info!("SIDEBAR get_chat id={} FAILED", id);
                     }
                 },
             );
@@ -472,26 +499,8 @@ impl ChatList {
             .map(crate::models::chat_object::message_preview)
             .unwrap_or_default();
 
-        tracing::debug!(
-            title = %chat.title,
-            has_last_message = chat.last_message.is_some(),
-            preview_len = preview.len(),
-            "add_or_update"
-        );
-
-        let in_index = self.inner.index.borrow().contains_key(&id);
-        tracing::info!(
-            "SIDEBAR add_or_update id={} title={:?} has_last={} preview_len={} in_index={}",
-            id,
-            chat.title,
-            chat.last_message.is_some(),
-            preview.len(),
-            in_index
-        );
-
         let existing = self.inner.index.borrow().get(&id).cloned();
         if let Some(obj) = existing {
-            tracing::info!("SIDEBAR add_or_update id={} branch=existing preview_empty={}", id, preview.is_empty());
             obj.set_title(chat.title.as_str());
             obj.set_unread_count(chat.unread_count);
             obj.set_order(Self::main_order(&chat.positions));
@@ -501,7 +510,6 @@ impl ChatList {
             obj.set_photo_file_id(chat.photo.as_ref().map(|p| p.small.id).unwrap_or(0));
             self.notify_changed(id);
         } else {
-            tracing::info!("SIDEBAR add_or_update id={} branch=new preview_empty={}", id, preview.is_empty());
             let obj = ChatObject::from_chat(&chat);
             self.inner.store.append(&obj);
             self.inner.index.borrow_mut().insert(id, obj);
@@ -523,7 +531,6 @@ impl ChatList {
     /// chat's preview. Keyed by `chat_id` through the index, so it's safe against
     /// row recycling. Only called for chats that arrived without a preview.
     fn fetch_last_message(&self, chat_id: i64) {
-        tracing::info!("SIDEBAR fetch_last spawn id={}", chat_id);
         let cid = self.inner.client.client_id();
         let this = self.clone();
         crate::runtime::spawn(
@@ -535,39 +542,21 @@ impl ChatList {
                 }
             },
             move |res| {
-                let got_msg = res.is_some();
                 if let Some(msg) = res {
                     let preview = crate::models::chat_object::message_preview(&msg);
-                    let obj_found = this.inner.index.borrow().contains_key(&chat_id);
-                    tracing::info!(
-                        "SIDEBAR fetch_last done id={} got_msg={} preview={:?} obj_found={}",
-                        chat_id,
-                        got_msg,
-                        preview,
-                        obj_found
-                    );
                     if let Some(obj) = this.inner.index.borrow().get(&chat_id) {
                         obj.set_last_message(preview);
-                    } else {
-                        return;
+                        this.notify_changed(chat_id);
                     }
-                    this.notify_changed(chat_id);
-                } else {
-                    let obj_found = this.inner.index.borrow().contains_key(&chat_id);
-                    tracing::info!(
-                        "SIDEBAR fetch_last done id={} got_msg={} preview={:?} obj_found={}",
-                        chat_id,
-                        got_msg,
-                        "",
-                        obj_found
-                    );
                 }
             },
         );
     }
 
-    /// Force the factory to re-bind the row for `chat_id`, reflecting mutations
-    /// made to its live [`ChatObject`]. No-op if the chat isn't in the store.
+    /// Nudge the store's `items_changed` for `chat_id`'s row. Content now flows
+    /// through GObject property bindings, so this is no longer needed to refresh
+    /// text; it's retained as a cheap belt-and-braces re-emit. No-op if the chat
+    /// isn't in the store.
     fn notify_changed(&self, chat_id: i64) {
         let n = self.inner.store.n_items();
         for pos in 0..n {
