@@ -205,7 +205,7 @@ impl ChatView {
         entry_scroll.add_css_class("msg-entry-scroll");
 
         let send_button = gtk::Button::builder()
-            .icon_name("paper-plane-symbolic")
+            .icon_name("document-send-symbolic")
             .valign(gtk::Align::End)
             .css_classes(["circular", "suggested-action", "msg-send"])
             .tooltip_text("Send")
@@ -770,6 +770,11 @@ impl ChatView {
     }
 
     /// Fill in `sender_name` for an incoming message; queue unknown user ids.
+    ///
+    /// Names are only shown in groups, but the AVATAR is shown for every incoming
+    /// message (group OR 1:1), so we queue the sender's user id for resolution in
+    /// both cases — `resolve_names` stamps the avatar regardless of group-ness and
+    /// only stamps the name in groups.
     fn apply_sender_name(
         &self,
         obj: &MessageObject,
@@ -779,16 +784,15 @@ impl ChatView {
         if obj.is_outgoing() {
             return;
         }
-        // Sender names are only shown in group chats.
-        if !self.inner.is_group.get() {
-            return;
-        }
         if let MessageSender::User(u) = sender {
-            if let Some(name) = self.inner.names.borrow().get(&u.user_id) {
-                obj.set_sender_name(name.clone());
-            } else {
-                to_resolve.push(u.user_id);
+            // In groups, stamp an already-known name synchronously.
+            if self.inner.is_group.get() {
+                if let Some(name) = self.inner.names.borrow().get(&u.user_id) {
+                    obj.set_sender_name(name.clone());
+                }
             }
+            // Always queue for resolution so the avatar resolves in 1:1 too.
+            to_resolve.push(u.user_id);
         }
     }
 
@@ -811,12 +815,13 @@ impl ChatView {
         self.resolve_names(ids);
     }
 
-    /// Resolve display names for the given user ids, then re-apply.
+    /// Resolve display + avatar for the given user ids, then re-apply.
+    ///
+    /// The AVATAR is resolved for every incoming sender (group OR 1:1); the NAME
+    /// is only stamped in group chats (`apply_name_to_rows` is itself group-gated).
+    /// We no longer early-return on non-group here, otherwise 1:1 senders would
+    /// never resolve their avatar.
     fn resolve_names(&self, user_ids: Vec<i64>) {
-        // Sender names are only shown in group chats.
-        if !self.inner.is_group.get() {
-            return;
-        }
         for uid in user_ids {
             if uid == 0 || self.inner.names.borrow().contains_key(&uid) {
                 continue;
@@ -835,6 +840,8 @@ impl ChatView {
                             .as_ref()
                             .map(|p| p.small.id)
                             .unwrap_or(0);
+                        // Name only shows in groups (apply_name_to_rows gates it);
+                        // avatar shows for all incoming rows.
                         this.apply_name_to_rows(uid, &name);
                         this.apply_avatar_to_rows(uid, avatar_id);
                     }
@@ -868,8 +875,9 @@ impl ChatView {
     /// inserted incoming row by `uid` and re-bind those rows so the trailing
     /// avatar of each same-sender run downloads and appears live.
     fn apply_avatar_to_rows(&self, uid: i64, avatar_file_id: i32) {
-        // Avatars are only shown for incoming group messages.
-        if !self.inner.is_group.get() || avatar_file_id == 0 {
+        // Avatars are shown for every incoming sender (group OR 1:1); keep the
+        // guard against a missing avatar (file id 0 → initials fallback).
+        if avatar_file_id == 0 {
             return;
         }
         let store = &self.inner.store;
@@ -1338,6 +1346,13 @@ impl ChatView {
         group.add_action(&copy);
         group.add_action(&delete);
 
+        // Insert the action group on the popover's PARENT (the list view) as
+        // well as the popover itself. On some GTK4 versions actions inserted on
+        // a PopoverMenu AFTER `from_model` don't bind to the menu items; routing
+        // the `msg.*` actions through the parent's action muxer makes them
+        // resolve reliably. `insert_action_group` holds a strong ref, so the
+        // group stays alive for the popover's lifetime.
+        list_view.insert_action_group("msg", Some(&group));
         let popover = gtk::PopoverMenu::from_model(Some(&menu));
         popover.set_parent(list_view);
         popover.insert_action_group("msg", Some(&group));
@@ -1546,7 +1561,7 @@ fn build_row(_: &gtk::SignalListItemFactory, list_item: &glib::Object) {
 
     // Photo (hidden unless the message is a photo).
     let picture = gtk::Picture::builder()
-        .content_fit(gtk::ContentFit::Cover)
+        .content_fit(gtk::ContentFit::Contain)
         .can_shrink(true)
         .build();
     picture.add_css_class("msg-photo");
@@ -1725,17 +1740,17 @@ fn bind_row(list_item: &glib::Object, store: &gio::ListStore, files: &FileStore)
         }
     }
 
-    // Sender avatar (incoming, groups only). Shown only on the LAST row of a
-    // same-sender run; earlier rows of the run keep the slot but hide the image
-    // so bubbles stay left-aligned. Outgoing / 1:1 rows collapse the slot to 0.
+    // Sender avatar (every incoming message, group OR 1:1). Shown only on the
+    // LAST row of a same-sender run; earlier rows of the run keep the slot but
+    // hide the image so bubbles stay left-aligned. Outgoing rows collapse the
+    // slot to 0.
     if let Some(avatar) = find::<adw::Avatar>(&root, "avatar") {
-        let is_group = !item.sender_name().is_empty();
-        // A non-empty sender-name only ever occurs for incoming group messages
-        // (apply_sender_name/resolve_names early-return otherwise); combined with
-        // !outgoing this gates the avatar to incoming group rows exactly like the
-        // sender label above.
-        if !outgoing && is_group {
-            // Reserve the slot on every group-incoming row.
+        // The sender avatar is shown for EVERY incoming message (group OR 1:1),
+        // never for outgoing. In groups the initials fallback uses the sender
+        // name; in 1:1 the name is empty and adw::Avatar falls back to a generic
+        // person icon, which is fine.
+        if !outgoing {
+            // Reserve the slot on every incoming row.
             avatar.set_size(AVATAR_SIZE);
             avatar.set_show_initials(true);
             avatar.set_text(Some(&item.sender_name()));
@@ -1886,9 +1901,9 @@ fn grouped_with(a: Option<&MessageObject>, b: Option<&MessageObject>) -> bool {
 /// Constrain the picture to a chat-friendly box while preserving aspect ratio.
 fn size_picture(picture: &gtk::Picture, width: i32, height: i32) {
     const MAX_W: i32 = 320;
-    const MAX_H: i32 = 320;
+    const MAX_H: i32 = 400;
     if width <= 0 || height <= 0 {
-        picture.set_size_request(MAX_W, 200);
+        picture.set_size_request(MAX_W, 240);
         return;
     }
     let scale = (MAX_W as f64 / width as f64)
