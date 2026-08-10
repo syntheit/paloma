@@ -24,6 +24,8 @@ mod imp {
         pub title: RefCell<String>,
         #[property(get, set, name = "last-message")]
         pub last_message: RefCell<String>,
+        #[property(get, set, name = "last-message-date")]
+        pub last_message_date: Cell<i64>,
         #[property(get, set, name = "unread-count")]
         pub unread_count: Cell<i32>,
         #[property(get, set)]
@@ -68,6 +70,9 @@ impl ChatObject {
                 .as_ref()
                 .map(message_preview)
                 .unwrap_or_default(),
+        );
+        obj.set_last_message_date(
+            chat.last_message.as_ref().map(|m| m.date as i64).unwrap_or(0),
         );
         obj.set_photo_file_id(photo_file_id_of(chat));
         obj

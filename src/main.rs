@@ -5,6 +5,7 @@
 
 mod app;
 mod config;
+mod format;
 mod models;
 mod runtime;
 mod tdlib;

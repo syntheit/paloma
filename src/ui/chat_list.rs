@@ -28,6 +28,7 @@ use std::rc::Rc;
 use tdlib_rs::enums::ChatList as TdChatList;
 
 use crate::models::ChatObject;
+use crate::format::sidebar_time;
 
 /// The chat sidebar component. Cheap to `.clone()` — the widget tree and all
 /// state live behind the shared `Rc<Inner>`.
@@ -114,13 +115,29 @@ impl ChatList {
 
             hbox.append(&text_box);
 
-            // Unread badge, right-aligned and vertically centred.
-            let badge = gtk::Label::builder()
-                .css_classes(["unread-badge"])
+            // Right column: last-message time on top, unread badge below,
+            // both right-aligned (native-Telegram layout).
+            let right_box = gtk::Box::builder()
+                .orientation(gtk::Orientation::Vertical)
+                .spacing(4)
                 .valign(gtk::Align::Center)
                 .build();
+
+            let time_label = gtk::Label::builder()
+                .css_classes(["chat-time", "dim-label"])
+                .halign(gtk::Align::End)
+                .build();
+            time_label.set_widget_name("time");
+            right_box.append(&time_label);
+
+            let badge = gtk::Label::builder()
+                .css_classes(["unread-badge"])
+                .halign(gtk::Align::End)
+                .build();
             badge.set_widget_name("badge");
-            hbox.append(&badge);
+            right_box.append(&badge);
+
+            hbox.append(&right_box);
 
             list_item.set_child(Some(&hbox));
         });
@@ -198,6 +215,20 @@ impl ChatList {
             if let Some(preview) = find::<gtk::Label>(&root, "preview") {
                 bindings.push(
                     item.bind_property("last-message", &preview, "label")
+                        .sync_create()
+                        .build(),
+                );
+            }
+            if let Some(time) = find::<gtk::Label>(&root, "time") {
+                bindings.push(
+                    item.bind_property("last-message-date", &time, "label")
+                        .transform_to(|_, secs: i64| {
+                            Some(if secs == 0 {
+                                String::new()
+                            } else {
+                                sidebar_time(secs)
+                            })
+                        })
                         .sync_create()
                         .build(),
                 );
@@ -381,6 +412,9 @@ impl ChatList {
                             .map(crate::models::chat_object::message_preview)
                             .unwrap_or_default(),
                     );
+                    obj.set_last_message_date(
+                        u.last_message.as_ref().map(|m| m.date as i64).unwrap_or(0),
+                    );
                     obj.set_order(order);
                 }
                 self.notify_changed(u.chat_id);
@@ -506,6 +540,9 @@ impl ChatList {
             obj.set_order(Self::main_order(&chat.positions));
             if !preview.is_empty() {
                 obj.set_last_message(preview.clone());
+                obj.set_last_message_date(
+                    chat.last_message.as_ref().map(|m| m.date as i64).unwrap_or(0),
+                );
             }
             obj.set_photo_file_id(chat.photo.as_ref().map(|p| p.small.id).unwrap_or(0));
             self.notify_changed(id);
@@ -546,6 +583,7 @@ impl ChatList {
                     let preview = crate::models::chat_object::message_preview(&msg);
                     if let Some(obj) = this.inner.index.borrow().get(&chat_id) {
                         obj.set_last_message(preview);
+                        obj.set_last_message_date(msg.date as i64);
                         this.notify_changed(chat_id);
                     }
                 }
