@@ -2061,18 +2061,16 @@ impl ChatView {
 
     /// Wire right-click + long-press on the list to open a per-message menu.
     fn wire_row_menu(&self) {
-        // Right-click (secondary button) → context menu at the pointer. Uses the
-        // capture phase so the list sees the secondary press before it reaches a
-        // selectable message `gtk::Label`, whose built-in context menu would
-        // otherwise claim it; claiming the sequence suppresses that menu.
+        // Right-click (secondary button) → context menu at the pointer. The
+        // message body `gtk::Label` is non-selectable, so it no longer shows its
+        // own built-in secondary-click menu; a plain bubble-phase gesture reaches
+        // the list uncontested and opens our popover, matching the long-press.
         let right = gtk::GestureClick::new();
         right.set_button(gtk::gdk::BUTTON_SECONDARY);
-        right.set_propagation_phase(gtk::PropagationPhase::Capture);
         let this = self.clone();
         right.connect_pressed(move |gesture, _n, x, y| {
             if let Some(widget) = gesture.widget() {
                 this.popup_menu_at(&widget, x, y);
-                gesture.set_state(gtk::EventSequenceState::Claimed);
             }
         });
         self.inner.list_view.add_controller(right);
@@ -2220,9 +2218,11 @@ impl ChatView {
             .build();
 
         // --- Quick-reaction emoji bar (pill row on top) ---
-        // Seeded asynchronously from the chat's available reactions below; falls
-        // back to `PICKER_EMOJI` if that fetch is empty or fails so it's never
-        // blank.
+        // Populated synchronously with `PICKER_EMOJI` below so the popover opens
+        // at its final height on the first frame (an empty bar that filled later
+        // would re-fit the popover and scroll the parent list). The async fetch
+        // then swaps the contents in place — a same-height, horizontal-only
+        // change that won't trigger a vertical re-fit.
         let bar = gtk::Box::builder()
             .orientation(gtk::Orientation::Horizontal)
             .spacing(2)
@@ -2231,7 +2231,7 @@ impl ChatView {
         container.append(&bar);
 
         // Append one flat emoji button to `bar` that toggles the reaction and
-        // dismisses the popover. Shared by the async fill and the fallback.
+        // dismisses the popover. Shared by the sync fallback and the async swap.
         let add_pick = {
             let this = self.clone();
             let popover = popover.clone();
@@ -2251,13 +2251,19 @@ impl ChatView {
             }
         };
 
+        // Seed the fallback set synchronously so the bar is full-height at popup.
+        for e in PICKER_EMOJI {
+            add_pick(e.to_string());
+        }
+
         // Fetch the chat's actually-available reactions (TDLib rejects emoji that
         // aren't allowed here, which is what produced the "Couldn't add reaction"
         // toasts). Prefer top, then popular, then recent; keep only plain emoji
-        // reactions up to a small cap, and fall back to `PICKER_EMOJI` when the
-        // fetch is empty or fails.
+        // reactions up to a small cap. On success, swap the fallback out in place;
+        // on empty/failure, leave the synchronous fallback as-is.
         let cid = self.inner.client.client_id();
         let chat_id = self.inner.chat_id;
+        let bar_async = bar.clone();
         crate::runtime::spawn(
             async move {
                 functions::get_message_available_reactions(chat_id, message_id, 8, cid).await
@@ -2278,8 +2284,14 @@ impl ChatView {
                         }
                     }
                 }
+                // No usable reactions → keep the synchronous fallback untouched.
                 if emoji.is_empty() {
-                    emoji = PICKER_EMOJI.iter().map(|s| s.to_string()).collect();
+                    return;
+                }
+                // Swap the fallback buttons for the fetched set in place. Same
+                // height, so no vertical re-fit; harmless if the popover closed.
+                while let Some(child) = bar_async.first_child() {
+                    bar_async.remove(&child);
                 }
                 for e in emoji {
                     add_pick(e);
@@ -2663,7 +2675,7 @@ fn build_row(_: &gtk::SignalListItemFactory, list_item: &glib::Object) {
         .xalign(0.0)
         .wrap(true)
         .wrap_mode(gtk::pango::WrapMode::WordChar)
-        .selectable(true)
+        .selectable(false)
         .max_width_chars(36)
         .build();
     body.set_widget_name("body");
