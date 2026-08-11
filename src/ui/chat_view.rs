@@ -1640,42 +1640,6 @@ impl ChatView {
         self.inner.entry.grab_focus();
     }
 
-    /// Pop a small fixed emoji picker anchored at (`x`,`y`) in the list view.
-    /// Tapping an emoji toggles the current user's reaction on `message_id`
-    /// (add if absent, remove if already chosen). v1 offers a fixed common set
-    /// rather than fetching the chat's available reactions.
-    fn show_reaction_picker(&self, list_view: &gtk::Widget, message_id: i64, x: f64, y: f64) {
-        // TODO: populate from getMessageAvailableReactions per chat — a chat may
-        // restrict which reactions are allowed, so a fixed set can silently no-op.
-        const PICKER_EMOJI: [&str; 7] = ["👍", "❤️", "🔥", "🎉", "😁", "😢", "🙏"];
-        let row = gtk::Box::builder()
-            .orientation(gtk::Orientation::Horizontal)
-            .spacing(2)
-            .css_classes(["msg-reaction-picker"])
-            .build();
-        let popover = gtk::Popover::builder().has_arrow(false).build();
-        popover.set_parent(list_view);
-        popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
-        for emoji in PICKER_EMOJI {
-            let button = gtk::Button::builder()
-                .label(emoji)
-                .css_classes(["flat", "msg-reaction-pick"])
-                .build();
-            let this = self.clone();
-            let popover = popover.clone();
-            let emoji = emoji.to_string();
-            button.connect_clicked(move |_| {
-                this.toggle_reaction(message_id, emoji.clone());
-                popover.popdown();
-            });
-            row.append(&button);
-        }
-        popover.set_child(Some(&row));
-        // Detach from the widget tree once dismissed.
-        popover.connect_closed(|p| p.unparent());
-        popover.popup();
-    }
-
     /// Toggle the current user's reaction `emoji` on `message_id`: remove it if
     /// the message's current reactions show the user already chose it, otherwise
     /// add it. The resulting `Update::MessageInteractionInfo` re-renders the
@@ -2222,16 +2186,90 @@ impl ChatView {
         }
     }
 
-    /// Identify the row under (`x`,`y`) inside the list view and pop a menu.
+    /// Identify the row under (`x`,`y`) inside the list view and pop a custom
+    /// context popover: a quick-reaction emoji bar on top plus a list of action
+    /// rows below.
+    ///
+    /// This deliberately avoids `gtk::PopoverMenu` + `gio::Action`: on this GTK
+    /// build the `msg.*` menu-model actions never fired (the menu just
+    /// dismissed). Instead every row is a plain `gtk::Button` whose
+    /// `connect_clicked` calls the target method directly — the same approach
+    /// the reaction bar and chips already use reliably.
     fn popup_menu_at(&self, list_view: &gtk::Widget, x: f64, y: f64) {
         let message_id = match self.message_id_at(list_view, x, y) {
             Some(id) => id,
             None => return,
         };
 
-        let menu = gio::Menu::new();
-        menu.append(Some("React…"), Some("msg.react"));
-        menu.append(Some("Reply"), Some("msg.reply"));
+        // Common fast-react set, mirrored from the old picker. Tapping one
+        // toggles the current user's reaction and dismisses the popover.
+        const PICKER_EMOJI: [&str; 7] = ["👍", "❤️", "🔥", "🎉", "😁", "😢", "🙏"];
+
+        let popover = gtk::Popover::builder().has_arrow(false).build();
+        popover.set_parent(list_view);
+        popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+
+        let container = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .css_classes(["msg-menu"])
+            .build();
+
+        // --- Quick-reaction emoji bar (pill row on top) ---
+        let bar = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(2)
+            .css_classes(["msg-reaction-picker"])
+            .build();
+        for emoji in PICKER_EMOJI {
+            let button = gtk::Button::builder()
+                .label(emoji)
+                .css_classes(["flat", "msg-reaction-pick"])
+                .build();
+            let this = self.clone();
+            let popover = popover.clone();
+            let emoji = emoji.to_string();
+            button.connect_clicked(move |_| {
+                this.toggle_reaction(message_id, emoji.clone());
+                popover.popdown();
+            });
+            bar.append(&button);
+        }
+        container.append(&bar);
+
+        // --- Action rows below the bar ---
+        // Each row is an icon + label inside a flat button; clicking invokes the
+        // target method directly then dismisses.
+        let make_item = |icon: &str, label: &str, destructive: bool| -> gtk::Button {
+            let content = gtk::Box::builder()
+                .orientation(gtk::Orientation::Horizontal)
+                .spacing(10)
+                .build();
+            content.append(&gtk::Image::from_icon_name(icon));
+            content.append(
+                &gtk::Label::builder()
+                    .label(label)
+                    .halign(gtk::Align::Start)
+                    .hexpand(true)
+                    .build(),
+            );
+            let mut classes = vec!["flat", "msg-menu-item"];
+            if destructive {
+                classes.push("destructive");
+            }
+            gtk::Button::builder().css_classes(classes).child(&content).build()
+        };
+
+        let reply = make_item("mail-reply-sender-symbolic", "Reply", false);
+        {
+            let this = self.clone();
+            let popover = popover.clone();
+            reply.connect_clicked(move |_| {
+                this.start_reply(message_id);
+                popover.popdown();
+            });
+        }
+        container.append(&reply);
+
         // Edit only applies to plain-text messages; `begin_edit` still confirms
         // `can_be_edited` asynchronously before arming the compose strip.
         let is_text = self
@@ -2242,66 +2280,50 @@ impl ChatView {
             .map(|obj| obj.kind() == kind::TEXT)
             .unwrap_or(false);
         if is_text {
-            menu.append(Some("Edit"), Some("msg.edit"));
+            let edit = make_item("document-edit-symbolic", "Edit", false);
+            let this = self.clone();
+            let popover = popover.clone();
+            edit.connect_clicked(move |_| {
+                this.begin_edit(message_id);
+                popover.popdown();
+            });
+            container.append(&edit);
         }
-        menu.append(Some("Copy"), Some("msg.copy"));
-        menu.append(Some("Forward"), Some("msg.forward"));
-        menu.append(Some("Delete"), Some("msg.delete"));
 
-        let group = gio::SimpleActionGroup::new();
-        let react = gio::SimpleAction::new("react", None);
-        let reply = gio::SimpleAction::new("reply", None);
-        let edit = gio::SimpleAction::new("edit", None);
-        let copy = gio::SimpleAction::new("copy", None);
-        let forward = gio::SimpleAction::new("forward", None);
-        let delete = gio::SimpleAction::new("delete", None);
+        let copy = make_item("edit-copy-symbolic", "Copy", false);
         {
             let this = self.clone();
-            // Anchor the picker at the tapped point in the list view.
-            let list_view = list_view.clone();
-            react.connect_activate(move |_, _| {
-                this.show_reaction_picker(&list_view, message_id, x, y);
+            let popover = popover.clone();
+            copy.connect_clicked(move |_| {
+                this.copy_message(message_id);
+                popover.popdown();
             });
         }
-        {
-            let this = self.clone();
-            reply.connect_activate(move |_, _| this.start_reply(message_id));
-        }
-        {
-            let this = self.clone();
-            edit.connect_activate(move |_, _| this.begin_edit(message_id));
-        }
-        {
-            let this = self.clone();
-            copy.connect_activate(move |_, _| this.copy_message(message_id));
-        }
-        {
-            let this = self.clone();
-            forward.connect_activate(move |_, _| this.forward_message(message_id));
-        }
-        {
-            let this = self.clone();
-            delete.connect_activate(move |_, _| this.delete_message(message_id));
-        }
-        group.add_action(&react);
-        group.add_action(&reply);
-        group.add_action(&edit);
-        group.add_action(&copy);
-        group.add_action(&forward);
-        group.add_action(&delete);
+        container.append(&copy);
 
-        // Insert the action group on the popover's PARENT (the list view) as
-        // well as the popover itself. On some GTK4 versions actions inserted on
-        // a PopoverMenu AFTER `from_model` don't bind to the menu items; routing
-        // the `msg.*` actions through the parent's action muxer makes them
-        // resolve reliably. `insert_action_group` holds a strong ref, so the
-        // group stays alive for the popover's lifetime.
-        list_view.insert_action_group("msg", Some(&group));
-        let popover = gtk::PopoverMenu::from_model(Some(&menu));
-        popover.set_parent(list_view);
-        popover.insert_action_group("msg", Some(&group));
-        popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
-        popover.set_has_arrow(false);
+        let forward = make_item("mail-forward-symbolic", "Forward", false);
+        {
+            let this = self.clone();
+            let popover = popover.clone();
+            forward.connect_clicked(move |_| {
+                this.forward_message(message_id);
+                popover.popdown();
+            });
+        }
+        container.append(&forward);
+
+        let delete = make_item("user-trash-symbolic", "Delete", true);
+        {
+            let this = self.clone();
+            let popover = popover.clone();
+            delete.connect_clicked(move |_| {
+                this.delete_message(message_id);
+                popover.popdown();
+            });
+        }
+        container.append(&delete);
+
+        popover.set_child(Some(&container));
         // Detach the popover from the widget tree once dismissed.
         popover.connect_closed(|p| p.unparent());
         popover.popup();

@@ -231,11 +231,28 @@ const APP_CSS: &str = "
 }
 .msg-reaction-picker {
     padding: 2px;
+    border-radius: 9999px;
+    background-color: alpha(@card_fg_color, 0.06);
 }
 .msg-reaction-pick {
     font-size: 1.3em;
     padding: 4px 6px;
     min-width: 0;
+}
+/* Custom per-message context popover: reaction bar + action rows. */
+.msg-menu {
+    min-width: 180px;
+}
+.msg-menu-item {
+    padding: 8px 10px;
+    border-radius: 6px;
+    margin: 1px 0;
+}
+.msg-menu-item:hover {
+    background-color: alpha(@card_fg_color, 0.1);
+}
+.msg-menu-item.destructive {
+    color: @error_color;
 }
 ";
 
