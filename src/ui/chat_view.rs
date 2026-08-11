@@ -112,6 +112,8 @@ struct Inner {
     loading_older: Cell<bool>,
     /// The message id we're composing a reply to, or 0 for a normal message.
     reply_to: Cell<i64>,
+    /// The message id we're currently editing, or 0 when not editing.
+    editing: Cell<i64>,
     list_view: gtk::ListView,
     scroller: gtk::ScrolledWindow,
     entry: gtk::TextView,
@@ -122,6 +124,11 @@ struct Inner {
     reply_bar: gtk::Revealer,
     reply_bar_name: gtk::Label,
     reply_bar_text: gtk::Label,
+    /// Edit-preview strip shown above the compose entry while editing a message.
+    edit_bar: gtk::Revealer,
+    edit_bar_text: gtk::Label,
+    /// Toast host over the history, for transient confirmations (e.g. forwards).
+    toasts: adw::ToastOverlay,
     /// The subscription loop task; aborted in `close()` so it drops its
     /// receiver and the strong `ChatView` it captures (else the view leaks).
     sub_task: RefCell<Option<glib::JoinHandle<()>>>,
@@ -239,6 +246,53 @@ impl ChatView {
             .child(&reply_inner)
             .build();
 
+        // --- Edit-preview strip (revealed while editing a message). ----------
+        let edit_bar_name = gtk::Label::builder()
+            .css_classes(["reply-bar-name"])
+            .label("Editing")
+            .xalign(0.0)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .single_line_mode(true)
+            .build();
+        let edit_bar_text = gtk::Label::builder()
+            .css_classes(["reply-bar-text", "dim-label"])
+            .xalign(0.0)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .single_line_mode(true)
+            .build();
+        let edit_bar_labels = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .hexpand(true)
+            .valign(gtk::Align::Center)
+            .build();
+        edit_bar_labels.append(&edit_bar_name);
+        edit_bar_labels.append(&edit_bar_text);
+
+        let edit_cancel = gtk::Button::builder()
+            .icon_name("window-close-symbolic")
+            .valign(gtk::Align::Center)
+            .css_classes(["flat", "circular"])
+            .tooltip_text("Cancel edit")
+            .build();
+
+        let edit_inner = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(8)
+            .margin_top(4)
+            .margin_bottom(4)
+            .margin_start(8)
+            .margin_end(8)
+            .build();
+        edit_inner.add_css_class("reply-bar");
+        edit_inner.append(&edit_bar_labels);
+        edit_inner.append(&edit_cancel);
+
+        let edit_bar = gtk::Revealer::builder()
+            .transition_type(gtk::RevealerTransitionType::SlideUp)
+            .reveal_child(false)
+            .child(&edit_inner)
+            .build();
+
         // --- Compose bar: a growing TextView + a send button. ----------------
         let entry = gtk::TextView::builder()
             .wrap_mode(gtk::WrapMode::WordChar)
@@ -333,6 +387,7 @@ impl ChatView {
             .build();
         compose.add_css_class("msg-compose");
         compose.append(&reply_bar);
+        compose.append(&edit_bar);
         compose.append(&compose_row);
         compose.append(&recording_row);
 
@@ -352,6 +407,10 @@ impl ChatView {
         scroll_down.set_visible(false);
         overlay.add_overlay(&scroll_down);
 
+        // Toast host wrapping the message history (transient confirmations).
+        let toasts = adw::ToastOverlay::new();
+        toasts.set_child(Some(&overlay));
+
         // History fills the space; compose bar pinned at the bottom.
         let toolbar = adw::ToolbarView::new();
 
@@ -362,7 +421,7 @@ impl ChatView {
         header.set_title_widget(Some(&header_title));
         toolbar.add_top_bar(&header);
 
-        toolbar.set_content(Some(&overlay));
+        toolbar.set_content(Some(&toasts));
         toolbar.add_bottom_bar(&compose);
 
         let inner = Rc::new(Inner {
@@ -387,6 +446,7 @@ impl ChatView {
             reached_top: Cell::new(false),
             loading_older: Cell::new(false),
             reply_to: Cell::new(0),
+            editing: Cell::new(0),
             list_view,
             scroller,
             entry,
@@ -394,6 +454,9 @@ impl ChatView {
             reply_bar,
             reply_bar_name,
             reply_bar_text,
+            edit_bar,
+            edit_bar_text,
+            toasts,
             sub_task: RefCell::new(None),
             temp_ids: RefCell::new(HashSet::new()),
             last_read_outbox: Cell::new(0),
@@ -416,6 +479,10 @@ impl ChatView {
         {
             let this2 = this.clone();
             reply_cancel.connect_clicked(move |_| this2.clear_reply());
+        }
+        {
+            let this2 = this.clone();
+            edit_cancel.connect_clicked(move |_| this2.cancel_edit());
         }
         this
     }
@@ -1267,6 +1334,11 @@ impl ChatView {
             #[strong]
             this,
             move |_, keyval, _keycode, state| {
+                // Escape cancels an in-progress edit before anything else.
+                if keyval == gtk::gdk::Key::Escape && this.inner.editing.get() != 0 {
+                    this.cancel_edit();
+                    return glib::Propagation::Stop;
+                }
                 let is_enter =
                     keyval == gtk::gdk::Key::Return || keyval == gtk::gdk::Key::KP_Enter;
                 let shift = state.contains(gtk::gdk::ModifierType::SHIFT_MASK);
@@ -1283,6 +1355,12 @@ impl ChatView {
 
     /// Read the compose buffer, send it, optimistically append a pending row.
     fn do_send(&self) {
+        // If we're editing, redirect the send to an edit of that message.
+        let editing = self.inner.editing.get();
+        if editing != 0 {
+            self.do_edit(editing);
+            return;
+        }
         let buffer = self.inner.entry.buffer();
         let (start, end) = buffer.bounds();
         let text = buffer.text(&start, &end, false).to_string();
@@ -1521,6 +1599,12 @@ impl ChatView {
             Some(o) => o,
             None => return,
         };
+        // Replying and editing are mutually exclusive compose states; if an edit
+        // was in progress, cancel it (clears the prefilled edit text) before
+        // arming the reply strip.
+        if self.inner.editing.get() != 0 {
+            self.exit_edit_ui();
+        }
         self.inner.reply_to.set(message_id);
         let name = if obj.is_outgoing() {
             "You".to_string()
@@ -1622,6 +1706,224 @@ impl ChatView {
     fn clear_reply(&self) {
         self.inner.reply_to.set(0);
         self.inner.reply_bar.set_reveal_child(false);
+    }
+
+    /// Begin editing `message_id` if TDLib says it's editable (gate mirrors
+    /// `delete_message`'s `get_message_properties` check).
+    fn begin_edit(&self, message_id: i64) {
+        let cid = self.inner.client.client_id();
+        let chat_id = self.inner.chat_id;
+        let this = self.clone();
+        crate::runtime::spawn(
+            async move { functions::get_message_properties(chat_id, message_id, cid).await },
+            move |res| match res {
+                Ok(MessagePropsEnum::MessageProperties(p)) => {
+                    if p.can_be_edited {
+                        this.enter_edit_mode(message_id);
+                    }
+                }
+                Err(_) => {}
+            },
+        );
+    }
+
+    /// Arm edit mode: prefill the compose entry with the message body and reveal
+    /// the edit strip. Sending now edits `message_id` instead of composing anew.
+    fn enter_edit_mode(&self, message_id: i64) {
+        let obj = match self.inner.index.borrow().get(&message_id).cloned() {
+            Some(o) => o,
+            None => return,
+        };
+        // Editing and replying are mutually exclusive compose states.
+        self.clear_reply();
+        self.inner.editing.set(message_id);
+        let text = obj.content_text();
+        self.inner.entry.buffer().set_text(&text);
+        self.inner.edit_bar_text.set_text(&snippet(&text));
+        self.inner.edit_bar.set_reveal_child(true);
+        // Focus the entry and drop the cursor at the end of the prefilled text.
+        let buffer = self.inner.entry.buffer();
+        let end = buffer.end_iter();
+        buffer.place_cursor(&end);
+        self.inner.entry.grab_focus();
+    }
+
+    /// Tear down the edit strip and clear the compose entry.
+    fn exit_edit_ui(&self) {
+        self.inner.editing.set(0);
+        self.inner.edit_bar.set_reveal_child(false);
+        self.inner.entry.buffer().set_text("");
+    }
+
+    /// Cancel an in-progress edit, discarding the compose entry contents.
+    fn cancel_edit(&self) {
+        self.exit_edit_ui();
+    }
+
+    /// Commit the compose entry as an edit of `message_id` via `edit_message_text`.
+    fn do_edit(&self, message_id: i64) {
+        let buffer = self.inner.entry.buffer();
+        let (start, end) = buffer.bounds();
+        let text = buffer.text(&start, &end, false).to_string();
+        let text = text.trim().to_string();
+        if text.is_empty() {
+            // Keep edit mode armed rather than deleting the message.
+            return;
+        }
+        let cid = self.inner.client.client_id();
+        let chat_id = self.inner.chat_id;
+        let content = InputMessageContent::InputMessageText(InputMessageText {
+            text: FormattedText {
+                text,
+                entities: vec![],
+            },
+            link_preview_options: None,
+            clear_draft: false,
+        });
+        // Reset the compose UI before the request resolves; the resulting
+        // `updateMessageContent` repaints the row in place.
+        self.exit_edit_ui();
+        crate::runtime::spawn(
+            async move { functions::edit_message_text(chat_id, message_id, content, cid).await },
+            |res| {
+                if let Err(e) = res {
+                    tracing::warn!(code = e.code, msg = %e.message, "edit_message_text failed");
+                }
+            },
+        );
+    }
+
+    /// Forward `message_id` if TDLib says it may be forwarded, then open a
+    /// destination picker (gate mirrors `begin_edit` / `delete_message`).
+    fn forward_message(&self, message_id: i64) {
+        let cid = self.inner.client.client_id();
+        let chat_id = self.inner.chat_id;
+        let this = self.clone();
+        crate::runtime::spawn(
+            async move { functions::get_message_properties(chat_id, message_id, cid).await },
+            move |res| match res {
+                Ok(MessagePropsEnum::MessageProperties(p)) => {
+                    if p.can_be_forwarded {
+                        this.open_forward_picker(message_id);
+                    }
+                }
+                Err(_) => {}
+            },
+        );
+    }
+
+    /// Present a dialog listing chats; activating a row forwards `message_id`
+    /// there. Titles resolve asynchronously per row. (No search filter yet.)
+    fn open_forward_picker(&self, message_id: i64) {
+        let list_box = gtk::ListBox::builder()
+            .selection_mode(gtk::SelectionMode::None)
+            .build();
+        list_box.add_css_class("boxed-list");
+        let scroller = gtk::ScrolledWindow::builder()
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .vexpand(true)
+            .child(&list_box)
+            .build();
+        let toolbar = adw::ToolbarView::new();
+        toolbar.add_top_bar(&adw::HeaderBar::new());
+        toolbar.set_content(Some(&scroller));
+        let dialog = adw::Dialog::builder()
+            .title("Forward to…")
+            .content_width(360)
+            .content_height(520)
+            .child(&toolbar)
+            .build();
+
+        // Fetch the Main chat list, then resolve each chat's title on its own row.
+        // The async blocks capture only the `Copy` client id (i32) — never the
+        // `!Send` `TdClient` — so the spawned futures stay `Send`; we call the
+        // underlying `functions::*` directly (mirroring `TdClient::get_chats` /
+        // `get_chat`) instead of the client convenience helpers.
+        let cid = self.inner.client.client_id();
+        let this = self.clone();
+        let list_box = list_box.clone();
+        let dialog_rows = dialog.clone();
+        crate::runtime::spawn(
+            async move {
+                use tdlib_rs::enums::{ChatList, Chats};
+                let Chats::Chats(c) =
+                    functions::get_chats(Some(ChatList::Main), 200, cid).await?;
+                Ok::<Vec<i64>, tdlib_rs::types::Error>(c.chat_ids)
+            },
+            move |res| {
+                let ids = match res {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!(code = e.code, msg = %e.message, "get_chats failed");
+                        return;
+                    }
+                };
+                for id in ids {
+                    let list_box = list_box.clone();
+                    let this = this.clone();
+                    let dialog = dialog_rows.clone();
+                    crate::runtime::spawn(
+                        async move {
+                            use tdlib_rs::enums::Chat;
+                            let Chat::Chat(c) = functions::get_chat(id, cid).await?;
+                            Ok::<tdlib_rs::types::Chat, tdlib_rs::types::Error>(c)
+                        },
+                        move |res| {
+                            let chat = match res {
+                                Ok(c) => c,
+                                Err(_) => return,
+                            };
+                            let dest = chat.id;
+                            let row = adw::ActionRow::builder()
+                                .title(chat.title)
+                                .activatable(true)
+                                .build();
+                            let this = this.clone();
+                            let dialog = dialog.clone();
+                            row.connect_activated(move |_| {
+                                this.do_forward(message_id, dest);
+                                dialog.close();
+                            });
+                            list_box.append(&row);
+                        },
+                    );
+                }
+            },
+        );
+
+        if let Some(root) = self.root.root() {
+            dialog.present(Some(&root));
+        } else {
+            dialog.present(Some(&self.root));
+        }
+    }
+
+    /// Issue the actual `forward_messages` request to `dest_chat_id`.
+    fn do_forward(&self, message_id: i64, dest_chat_id: i64) {
+        let cid = self.inner.client.client_id();
+        let from_chat_id = self.inner.chat_id;
+        let this = self.clone();
+        crate::runtime::spawn(
+            async move {
+                functions::forward_messages(
+                    dest_chat_id,
+                    None,
+                    from_chat_id,
+                    vec![message_id],
+                    None,
+                    false,
+                    false,
+                    cid,
+                )
+                .await
+            },
+            move |res| match res {
+                Ok(_) => crate::ui::toast(&this.inner.toasts, "Forwarded"),
+                Err(e) => {
+                    tracing::warn!(code = e.code, msg = %e.message, "forward_messages failed");
+                }
+            },
+        );
     }
 
     /// Copy a message's text to the clipboard.
@@ -1846,13 +2148,17 @@ impl ChatView {
         let menu = gio::Menu::new();
         menu.append(Some("React…"), Some("msg.react"));
         menu.append(Some("Reply"), Some("msg.reply"));
+        menu.append(Some("Edit"), Some("msg.edit"));
         menu.append(Some("Copy"), Some("msg.copy"));
+        menu.append(Some("Forward"), Some("msg.forward"));
         menu.append(Some("Delete"), Some("msg.delete"));
 
         let group = gio::SimpleActionGroup::new();
         let react = gio::SimpleAction::new("react", None);
         let reply = gio::SimpleAction::new("reply", None);
+        let edit = gio::SimpleAction::new("edit", None);
         let copy = gio::SimpleAction::new("copy", None);
+        let forward = gio::SimpleAction::new("forward", None);
         let delete = gio::SimpleAction::new("delete", None);
         {
             let this = self.clone();
@@ -1868,7 +2174,15 @@ impl ChatView {
         }
         {
             let this = self.clone();
+            edit.connect_activate(move |_, _| this.begin_edit(message_id));
+        }
+        {
+            let this = self.clone();
             copy.connect_activate(move |_, _| this.copy_message(message_id));
+        }
+        {
+            let this = self.clone();
+            forward.connect_activate(move |_, _| this.forward_message(message_id));
         }
         {
             let this = self.clone();
@@ -1876,7 +2190,9 @@ impl ChatView {
         }
         group.add_action(&react);
         group.add_action(&reply);
+        group.add_action(&edit);
         group.add_action(&copy);
+        group.add_action(&forward);
         group.add_action(&delete);
 
         // Insert the action group on the popover's PARENT (the list view) as
