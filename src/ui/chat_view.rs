@@ -2215,9 +2215,21 @@ impl ChatView {
         // toggles the current user's reaction and dismisses the popover.
         const PICKER_EMOJI: [&str; 7] = ["👍", "❤️", "🔥", "🎉", "😁", "😢", "🙏"];
 
+        // Parent the popover to the ScrolledWindow, NOT to the scrollable list
+        // content. Parenting to the list makes GTK scroll the list to fit this
+        // tall popover, throwing the menu off-screen on long chats (which also
+        // made long-press look dead). The ScrolledWindow's own position doesn't
+        // move when its child scrolls, so it's a stable anchor. Because the
+        // anchor changes, the (x,y) picked in list-view space must be translated
+        // into the ScrolledWindow's coordinate space for `set_pointing_to`
+        // (fall back to the raw coords if translation is unavailable).
+        let (tx, ty) = list_view
+            .translate_coordinates(&self.inner.scroller, x, y)
+            .unwrap_or((x, y));
+
         let popover = gtk::Popover::builder().has_arrow(false).build();
-        popover.set_parent(list_view);
-        popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+        popover.set_parent(&self.inner.scroller);
+        popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(tx as i32, ty as i32, 1, 1)));
 
         let container = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
