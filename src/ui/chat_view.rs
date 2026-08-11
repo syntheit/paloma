@@ -2061,13 +2061,18 @@ impl ChatView {
 
     /// Wire right-click + long-press on the list to open a per-message menu.
     fn wire_row_menu(&self) {
-        // Right-click (secondary button) → context menu at the pointer.
+        // Right-click (secondary button) → context menu at the pointer. Uses the
+        // capture phase so the list sees the secondary press before it reaches a
+        // selectable message `gtk::Label`, whose built-in context menu would
+        // otherwise claim it; claiming the sequence suppresses that menu.
         let right = gtk::GestureClick::new();
         right.set_button(gtk::gdk::BUTTON_SECONDARY);
+        right.set_propagation_phase(gtk::PropagationPhase::Capture);
         let this = self.clone();
         right.connect_pressed(move |gesture, _n, x, y| {
             if let Some(widget) = gesture.widget() {
                 this.popup_menu_at(&widget, x, y);
+                gesture.set_state(gtk::EventSequenceState::Claimed);
             }
         });
         self.inner.list_view.add_controller(right);
@@ -2215,26 +2220,72 @@ impl ChatView {
             .build();
 
         // --- Quick-reaction emoji bar (pill row on top) ---
+        // Seeded asynchronously from the chat's available reactions below; falls
+        // back to `PICKER_EMOJI` if that fetch is empty or fails so it's never
+        // blank.
         let bar = gtk::Box::builder()
             .orientation(gtk::Orientation::Horizontal)
             .spacing(2)
             .css_classes(["msg-reaction-picker"])
             .build();
-        for emoji in PICKER_EMOJI {
-            let button = gtk::Button::builder()
-                .label(emoji)
-                .css_classes(["flat", "msg-reaction-pick"])
-                .build();
+        container.append(&bar);
+
+        // Append one flat emoji button to `bar` that toggles the reaction and
+        // dismisses the popover. Shared by the async fill and the fallback.
+        let add_pick = {
             let this = self.clone();
             let popover = popover.clone();
-            let emoji = emoji.to_string();
-            button.connect_clicked(move |_| {
-                this.toggle_reaction(message_id, emoji.clone());
-                popover.popdown();
-            });
-            bar.append(&button);
-        }
-        container.append(&bar);
+            let bar = bar.clone();
+            move |emoji: String| {
+                let button = gtk::Button::builder()
+                    .label(&emoji)
+                    .css_classes(["flat", "msg-reaction-pick"])
+                    .build();
+                let this = this.clone();
+                let popover = popover.clone();
+                button.connect_clicked(move |_| {
+                    this.toggle_reaction(message_id, emoji.clone());
+                    popover.popdown();
+                });
+                bar.append(&button);
+            }
+        };
+
+        // Fetch the chat's actually-available reactions (TDLib rejects emoji that
+        // aren't allowed here, which is what produced the "Couldn't add reaction"
+        // toasts). Prefer top, then popular, then recent; keep only plain emoji
+        // reactions up to a small cap, and fall back to `PICKER_EMOJI` when the
+        // fetch is empty or fails.
+        let cid = self.inner.client.client_id();
+        let chat_id = self.inner.chat_id;
+        crate::runtime::spawn(
+            async move {
+                functions::get_message_available_reactions(chat_id, message_id, 8, cid).await
+            },
+            move |res| {
+                let mut emoji: Vec<String> = Vec::new();
+                if let Ok(tdlib_rs::enums::AvailableReactions::AvailableReactions(a)) = res {
+                    for group in [&a.top_reactions, &a.popular_reactions, &a.recent_reactions] {
+                        for r in group {
+                            if emoji.len() >= 8 {
+                                break;
+                            }
+                            if let tdlib_rs::enums::ReactionType::Emoji(e) = &r.r#type {
+                                if !emoji.contains(&e.emoji) {
+                                    emoji.push(e.emoji.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+                if emoji.is_empty() {
+                    emoji = PICKER_EMOJI.iter().map(|s| s.to_string()).collect();
+                }
+                for e in emoji {
+                    add_pick(e);
+                }
+            },
+        );
 
         // --- Action rows below the bar ---
         // Each row is an icon + label inside a flat button; clicking invokes the
