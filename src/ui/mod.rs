@@ -233,6 +233,7 @@ const APP_CSS: &str = "
     padding: 2px;
     border-radius: 9999px;
     background-color: alpha(@card_fg_color, 0.06);
+    min-height: 34px;
 }
 .msg-reaction-pick {
     font-size: 1.3em;

@@ -197,6 +197,9 @@ impl ChatView {
             if let Some(chips) = find::<gtk::Box>(&root, "reactions") {
                 clear_reactions_notify(&chips);
             }
+            if let Some(body) = find::<gtk::Label>(&root, "body") {
+                clear_content_notify(&body);
+            }
         });
 
         let selection = gtk::NoSelection::new(Some(store.clone()));
@@ -882,9 +885,13 @@ impl ChatView {
                 tracing::warn!(code = u.error.code, msg = %u.error.message, "message send failed");
             }
             Update::MessageContent(u) if u.chat_id == self.inner.chat_id => {
+                // The row repaints reactively via the body label's
+                // `notify::content-text` handler (set_content → set_content_text
+                // emits it), so we deliberately do NOT call notify_changed here:
+                // items_changed is unreliable for rebinds and disrupts the scroll
+                // anchor (would jump the chat).
                 if let Some(obj) = self.inner.index.borrow().get(&u.message_id).cloned() {
                     obj.set_content(&u.new_content);
-                    self.notify_changed(u.message_id);
                 }
             }
             Update::MessageInteractionInfo(u) if u.chat_id == self.inner.chat_id => {
@@ -2288,6 +2295,24 @@ impl ChatView {
                 if emoji.is_empty() {
                     return;
                 }
+                // Skip the swap entirely if the fetched set already matches what's
+                // shown (common: the fetched set equals the synchronous seed).
+                // Clearing to empty then refilling would momentarily collapse the
+                // bar and re-fit the popover (scroll jump), so only swap on change.
+                let current: Vec<String> = {
+                    let mut v = Vec::new();
+                    let mut child = bar_async.first_child();
+                    while let Some(c) = child {
+                        if let Some(btn) = c.downcast_ref::<gtk::Button>() {
+                            v.push(btn.label().map(|s| s.to_string()).unwrap_or_default());
+                        }
+                        child = c.next_sibling();
+                    }
+                    v
+                };
+                if current == emoji {
+                    return;
+                }
                 // Swap the fallback buttons for the fetched set in place. Same
                 // height, so no vertical re-fit; harmless if the popover closed.
                 while let Some(child) = bar_async.first_child() {
@@ -2763,6 +2788,9 @@ fn bind_row(list_item: &glib::Object, store: &gio::ListStore, files: &FileStore,
     if let Some(chips) = find::<gtk::Box>(&root, "reactions") {
         clear_reactions_notify(&chips);
     }
+    if let Some(body) = find::<gtk::Label>(&root, "body") {
+        clear_content_notify(&body);
+    }
 
     let outgoing = item.is_outgoing();
     // Stash the message id on the row so the context-menu gesture can find it.
@@ -3193,6 +3221,7 @@ fn bind_row(list_item: &glib::Object, store: &gio::ListStore, files: &FileStore,
     // Non-empty bodies render as markup with http/https URLs linkified; all
     // non-URL text is markup-escaped so message content can't inject markup.
     if let Some(body) = find::<gtk::Label>(&root, "body") {
+        let mut is_text_body = false;
         let text = if is_voice {
             String::new()
         } else if album_id != 0 && is_album_first {
@@ -3217,6 +3246,7 @@ fn bind_row(list_item: &glib::Object, store: &gio::ListStore, files: &FileStore,
         } else if kind == kind::PHOTO {
             item.media_caption()
         } else {
+            is_text_body = true;
             item.content_text()
         };
         if text.is_empty() {
@@ -3225,6 +3255,34 @@ fn bind_row(list_item: &glib::Object, store: &gio::ListStore, files: &FileStore,
             body.set_visible(true);
             body.set_use_markup(true);
             body.set_markup(&linkify(&text));
+        }
+        // Reactive body repaint on edit: when a text message is edited, TDLib
+        // fires Update::MessageContent → set_content → set_content_text, which
+        // emits `notify::content-text`. Re-render the body markup in place (no
+        // items_changed, so no scroll jump). Only for the plain text-body case;
+        // photo/voice/album bodies don't track content-text. The handler is
+        // stashed on the body label and torn down on the next bind / unbind
+        // (clear_content_notify), so a recycled row never reacts to a stale item.
+        if is_text_body {
+            let row_msg_id = item.id();
+            let body_ref = body.clone();
+            let li = list_item.clone();
+            let handler = item.connect_notify_local(Some("content-text"), move |item, _| {
+                let item = item.downcast_ref::<MessageObject>().expect("MessageObject");
+                // Recycle guard: skip if this row no longer shows the bound message.
+                if li.item().and_downcast::<MessageObject>().map(|m| m.id()) != Some(row_msg_id) {
+                    return;
+                }
+                let text = item.content_text();
+                if text.is_empty() {
+                    body_ref.set_visible(false);
+                } else {
+                    body_ref.set_visible(true);
+                    body_ref.set_use_markup(true);
+                    body_ref.set_markup(&linkify(&text));
+                }
+            });
+            store_content_notify(&body, &item, handler);
         }
     }
 
@@ -3552,6 +3610,34 @@ fn clear_avatar_notify(avatar: &adw::Avatar) {
     unsafe {
         if let Some((item, handler)) =
             avatar.steal_data::<(MessageObject, glib::SignalHandlerId)>(AVATAR_NOTIFY_KEY)
+        {
+            item.disconnect(handler);
+        }
+    }
+}
+
+/// Data key under which a row's body [`gtk::Label`] stashes its live
+/// `notify::content-text` `SignalHandlerId` (plus the object it is connected to),
+/// disconnected before a rebind installs a fresh handler so recycled rows never
+/// accumulate handlers or cross-wire to a stale MessageObject. Drives live
+/// re-render of the body markup when a message is edited (Update::MessageContent).
+const CONTENT_NOTIFY_KEY: &str = "paloma-content-notify";
+
+/// Stash the body label's live `content-text` notify handler (replacing any prior
+/// one, which is disconnected first).
+fn store_content_notify(body: &gtk::Label, item: &MessageObject, handler: glib::SignalHandlerId) {
+    clear_content_notify(body);
+    unsafe {
+        body.set_data(CONTENT_NOTIFY_KEY, (item.clone(), handler));
+    }
+}
+
+/// Disconnect and drop any `content-text` notify handler previously stashed on
+/// `body`, so a recycled row stops reacting to its old MessageObject.
+fn clear_content_notify(body: &gtk::Label) {
+    unsafe {
+        if let Some((item, handler)) =
+            body.steal_data::<(MessageObject, glib::SignalHandlerId)>(CONTENT_NOTIFY_KEY)
         {
             item.disconnect(handler);
         }
