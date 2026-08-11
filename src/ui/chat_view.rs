@@ -885,13 +885,25 @@ impl ChatView {
                 tracing::warn!(code = u.error.code, msg = %u.error.message, "message send failed");
             }
             Update::MessageContent(u) if u.chat_id == self.inner.chat_id => {
-                // The row repaints reactively via the body label's
-                // `notify::content-text` handler (set_content → set_content_text
-                // emits it), so we deliberately do NOT call notify_changed here:
-                // items_changed is unreliable for rebinds and disrupts the scroll
-                // anchor (would jump the chat).
                 if let Some(obj) = self.inner.index.borrow().get(&u.message_id).cloned() {
+                    // A plain-text edit repaints reactively via the body label's
+                    // `notify::content-text` handler (set_content → set_content_text
+                    // emits it), so for that common case we deliberately avoid
+                    // notify_changed: items_changed is unreliable for rebinds and
+                    // disrupts the scroll anchor (would jump the chat).
+                    //
+                    // But the reactive handler only touches the text label, so a
+                    // content update that changes the message KIND or its media
+                    // (photo/caption/voice/document/file ids) would leave the row
+                    // stale. Detect that by comparing the kind across set_content
+                    // and force a full rebind for anything that isn't a plain-text
+                    // → plain-text edit. The rarer media-change rebind may nudge
+                    // the scroll anchor, an acceptable trade for correct repaint.
+                    let prev_kind = obj.kind();
                     obj.set_content(&u.new_content);
+                    if !(prev_kind == kind::TEXT && obj.kind() == kind::TEXT) {
+                        self.notify_changed(u.message_id);
+                    }
                 }
             }
             Update::MessageInteractionInfo(u) if u.chat_id == self.inner.chat_id => {
@@ -2288,12 +2300,28 @@ impl ChatView {
                 functions::get_message_available_reactions(chat_id, message_id, 8, cid).await
             },
             move |res| {
+                // Distinguish a successful fetch (even one yielding no usable
+                // reactions) from an error. On success-but-empty we HIDE the
+                // bar so the popover never offers reactions TDLib will reject
+                // ("The reaction isn't available for the message" — the source
+                // of the old "Couldn't add reaction" confusion in restricted
+                // chats like Saved Messages or channels). On an Err we leave the
+                // synchronous fallback in place as a best effort.
+                let fetched_ok = matches!(
+                    &res,
+                    Ok(tdlib_rs::enums::AvailableReactions::AvailableReactions(_))
+                );
                 let mut emoji: Vec<String> = Vec::new();
                 if let Ok(tdlib_rs::enums::AvailableReactions::AvailableReactions(a)) = res {
                     for group in [&a.top_reactions, &a.popular_reactions, &a.recent_reactions] {
                         for r in group {
                             if emoji.len() >= 8 {
                                 break;
+                            }
+                            // Skip reactions gated behind Telegram Premium the
+                            // user may not have; adding those fails at TDLib.
+                            if r.needs_premium {
+                                continue;
                             }
                             if let tdlib_rs::enums::ReactionType::Emoji(e) = &r.r#type {
                                 if !emoji.contains(&e.emoji) {
@@ -2303,8 +2331,15 @@ impl ChatView {
                         }
                     }
                 }
-                // No usable reactions → keep the synchronous fallback untouched.
                 if emoji.is_empty() {
+                    // Fetch succeeded but nothing is addable here → hide the bar
+                    // so only the action rows show (this collapses the bar
+                    // cleanly; the popover just opened, and it's parented to the
+                    // ScrolledWindow so it won't scroll the chat). On an errored
+                    // fetch, keep the synchronous fallback as best effort.
+                    if fetched_ok {
+                        bar_async.set_visible(false);
+                    }
                     return;
                 }
                 // Skip the swap entirely if the fetched set already matches what's
@@ -2424,8 +2459,15 @@ impl ChatView {
         container.append(&delete);
 
         popover.set_child(Some(&container));
-        // Detach the popover from the widget tree once dismissed.
-        popover.connect_closed(|p| p.unparent());
+        // Clearing the child before unparenting drops the button subtree (and
+        // the `popover.clone()` captured by each button's clicked closure),
+        // breaking the popover→child→button→closure→popover reference cycle
+        // that would otherwise leak the menu (and its ChatView clones) on every
+        // open. Do this on close so re-opening rebuilds the menu fresh.
+        popover.connect_closed(|p| {
+            p.set_child(None::<&gtk::Widget>);
+            p.unparent();
+        });
         popover.popup();
     }
 
