@@ -62,8 +62,10 @@ const GROUP_WINDOW_SECS: i64 = 300;
 /// Pixel size of the per-message sender avatar shown in group chats.
 const AVATAR_SIZE: i32 = 30;
 
-/// Number of deterministic avatar placeholder colors (see `.avatar-color-N` in
-/// the app stylesheet). Keyed per-user so a sender's color never flips.
+/// Number of deterministic avatar placeholder colors, keyed per-user so a
+/// sender's color never flips. Mapped onto libadwaita's built-in
+/// `avatar.color1`..`.color14` classes (see the avatar block in `bind_row`);
+/// keep this <= 14.
 const AVATAR_COLOR_COUNT: i64 = 7;
 
 /// The message-history component for a single chat. Cheap to `.clone()` — the
@@ -2287,46 +2289,81 @@ fn bind_row(list_item: &glib::Object, store: &gio::ListStore, files: &FileStore,
         // never for outgoing. In groups the initials fallback uses the sender
         // name; in 1:1 the name is empty and adw::Avatar falls back to a generic
         // person icon, which is fine.
-        // Recycled rows may carry a stale color class; always drop it first so
-        // exactly one (or, for outgoing, none) is present after this bind.
+        // Recycled rows may carry a stale color class and a stale
+        // `notify::avatar-file-id` handler wired to the previous item; drop both
+        // first so this bind starts clean and never cross-wires.
         clear_avatar_color(&avatar);
+        clear_avatar_notify(&avatar);
         if !outgoing {
-            // Deterministic placeholder color, keyed on the sender id so a given
-            // user's color never flips across binds (AdwAvatar's own text-hash
-            // color is unstable because our avatar `text` changes per message).
-            let idx = item.sender_id().rem_euclid(AVATAR_COLOR_COUNT);
-            avatar.add_css_class(&format!("avatar-color-{idx}"));
-            // Reserve the slot on every incoming row.
+            // Deterministic placeholder color keyed on the sender id, using
+            // libadwaita's OWN built-in `.color1`..`.color14` avatar classes.
+            // These are the mechanism AdwAvatar actually honors (a plain custom
+            // `background:` can't beat its built-in `background-image` gradient),
+            // so the color is both stable per-user AND actually renders — unlike
+            // AdwAvatar's text-hash auto-color, which flips as our `text` changes.
+            let n = item.sender_id().rem_euclid(AVATAR_COLOR_COUNT) + 1;
+            avatar.add_css_class(&format!("color{n}"));
+            // Reserve the slot on every incoming row. `text` is a STABLE per-user
+            // value (the sender name) so nothing about the avatar varies per
+            // message; a resolved custom image (below) overrides the initials.
             avatar.set_size(AVATAR_SIZE);
             avatar.set_show_initials(true);
             avatar.set_text(Some(&item.sender_name()));
             avatar.set_custom_image(gtk::gdk::Paintable::NONE);
             if is_last_of_run {
                 avatar.set_visible(true);
-                let file_id = item.avatar_file_id();
-                if file_id != 0 {
-                    if let Some(path) = files.cached(file_id) {
-                        if let Ok(texture) = gtk::gdk::Texture::from_filename(&path) {
-                            avatar.set_custom_image(Some(&texture));
+                // The avatar file id resolves ASYNC (resolve_names → set on the
+                // MessageObject). items_changed does NOT reliably repaint list
+                // rows during TDLib update storms, so drive the image off a
+                // reactive `notify::avatar-file-id` handler instead: it fires the
+                // moment the id lands and re-runs the load. We also run it once
+                // now for the already-resolved case. The handler id is stashed on
+                // the avatar and torn down on the next bind (clear_avatar_notify).
+                let refresh = {
+                    let avatar = avatar.clone();
+                    let li = list_item.clone();
+                    let files = files.clone();
+                    move |item: &MessageObject| {
+                        let file_id = item.avatar_file_id();
+                        if file_id == 0 {
+                            return;
                         }
-                    } else {
-                        // Recycle-safe: only paint if this row still holds the
-                        // item we started the download for.
-                        let want = item.id();
-                        let avatar2 = avatar.clone();
-                        let li = list_item.clone();
-                        files.download(file_id, 12, move |path| {
-                            if li.item().and_downcast::<MessageObject>().map(|m| m.id())
-                                != Some(want)
-                            {
-                                return;
-                            }
+                        if let Some(path) = files.cached(file_id) {
                             if let Ok(texture) = gtk::gdk::Texture::from_filename(&path) {
-                                avatar2.set_custom_image(Some(&texture));
+                                avatar.set_custom_image(Some(&texture));
                             }
-                        });
+                        } else {
+                            // Recycle-safe: only paint if this row still holds the
+                            // item we started the download for.
+                            let want = item.id();
+                            let avatar2 = avatar.clone();
+                            let li = li.clone();
+                            files.download(file_id, 12, move |path| {
+                                if li.item().and_downcast::<MessageObject>().map(|m| m.id())
+                                    != Some(want)
+                                {
+                                    return;
+                                }
+                                if let Ok(texture) = gtk::gdk::Texture::from_filename(&path) {
+                                    avatar2.set_custom_image(Some(&texture));
+                                }
+                            });
+                        }
                     }
-                }
+                };
+                // Run once for the value already present at bind time.
+                refresh(&item);
+                // Then react to the async resolution. Only paint if the row still
+                // shows this item when the id lands.
+                let want = item.id();
+                let handler = item.connect_notify_local(Some("avatar-file-id"), move |item, _| {
+                    let item = item.downcast_ref::<MessageObject>().expect("MessageObject");
+                    if item.id() != want {
+                        return;
+                    }
+                    refresh(item);
+                });
+                store_avatar_notify(&avatar, &item, handler);
             } else {
                 // Earlier row of a run: keep the width, hide the drawing.
                 avatar.set_visible(false);
@@ -2795,10 +2832,38 @@ fn size_picture(picture: &gtk::Picture, width: i32, height: i32) {
     picture.set_size_request(w.max(1), h.max(1));
 }
 
-/// Remove any previously-applied `avatar-color-*` class from `avatar`.
+/// Remove any previously-applied libadwaita `.colorN` class from `avatar` so a
+/// recycled row carries exactly the one class this bind adds (or none).
 fn clear_avatar_color(avatar: &adw::Avatar) {
-    for i in 0..AVATAR_COLOR_COUNT {
-        avatar.remove_css_class(&format!("avatar-color-{i}"));
+    for n in 1..=AVATAR_COLOR_COUNT {
+        avatar.remove_css_class(&format!("color{n}"));
+    }
+}
+
+/// Data key under which the sender avatar stashes its current
+/// `notify::avatar-file-id` `SignalHandlerId` (plus the object it is connected
+/// to), disconnected before a rebind installs a fresh handler so recycled rows
+/// never accumulate or cross-wire to a stale MessageObject.
+const AVATAR_NOTIFY_KEY: &str = "paloma-avatar-notify";
+
+/// Stash the avatar's live `avatar-file-id` notify handler (replacing any prior
+/// one, which is disconnected first).
+fn store_avatar_notify(avatar: &adw::Avatar, item: &MessageObject, handler: glib::SignalHandlerId) {
+    clear_avatar_notify(avatar);
+    unsafe {
+        avatar.set_data(AVATAR_NOTIFY_KEY, (item.clone(), handler));
+    }
+}
+
+/// Disconnect and drop any `avatar-file-id` notify handler previously stashed on
+/// `avatar`, so a recycled row stops reacting to its old MessageObject.
+fn clear_avatar_notify(avatar: &adw::Avatar) {
+    unsafe {
+        if let Some((item, handler)) =
+            avatar.steal_data::<(MessageObject, glib::SignalHandlerId)>(AVATAR_NOTIFY_KEY)
+        {
+            item.disconnect(handler);
+        }
     }
 }
 

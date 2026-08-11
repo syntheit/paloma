@@ -148,17 +148,6 @@ const APP_CSS: &str = "
     background-color: alpha(@card_fg_color, 0.06);
 }
 
-/* --- Deterministic per-user avatar placeholder colors ---
-   Override AdwAvatar's text-hash auto-color (.color1..14). Our provider is at
-   PRIORITY_APPLICATION > the theme provider, so these win at equal specificity. */
-avatar.avatar-color-0 { background: #c03d33; color: #ffffff; }
-avatar.avatar-color-1 { background: #ce671b; color: #ffffff; }
-avatar.avatar-color-2 { background: #8544d6; color: #ffffff; }
-avatar.avatar-color-3 { background: #4fad2d; color: #ffffff; }
-avatar.avatar-color-4 { background: #2996ad; color: #ffffff; }
-avatar.avatar-color-5 { background: #168acd; color: #ffffff; }
-avatar.avatar-color-6 { background: #cd4073; color: #ffffff; }
-
 /* --- Voice notes --- */
 .msg-voice {
     min-width: 200px;
