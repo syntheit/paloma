@@ -62,12 +62,6 @@ const GROUP_WINDOW_SECS: i64 = 300;
 /// Pixel size of the per-message sender avatar shown in group chats.
 const AVATAR_SIZE: i32 = 30;
 
-/// Number of deterministic avatar placeholder colors, keyed per-user so a
-/// sender's color never flips. Mapped onto libadwaita's built-in
-/// `avatar.color1`..`.color14` classes (see the avatar block in `bind_row`);
-/// keep this <= 14.
-const AVATAR_COLOR_COUNT: i64 = 7;
-
 /// The message-history component for a single chat. Cheap to `.clone()` — the
 /// widget tree and all state live behind the shared `Rc<Inner>`.
 #[derive(Clone)]
@@ -165,6 +159,28 @@ impl ChatView {
         let bind_voice = voice.clone();
         factory.connect_bind(move |_, list_item| {
             bind_row(list_item, &this_store, &bind_files, &bind_voice);
+        });
+
+        // Tear down the per-row reactive notify handlers when a row leaves the
+        // viewport into the recycle pool. Without this, the stashed
+        // (MessageObject, SignalHandlerId) keeps the handler live between unbind
+        // and the next bind, holding the widget + ListItem alive and letting
+        // stale notifications fire into a pooled row. Runs on EVERY unbind.
+        factory.connect_unbind(|_, list_item| {
+            let list_item = list_item
+                .downcast_ref::<gtk::ListItem>()
+                .expect("list item is a ListItem");
+            let root = list_item
+                .child()
+                .and_downcast::<gtk::Box>()
+                .expect("row child is a Box")
+                .upcast::<gtk::Widget>();
+            if let Some(avatar) = find::<adw::Avatar>(&root, "avatar") {
+                clear_avatar_notify(&avatar);
+            }
+            if let Some(chips) = find::<gtk::Box>(&root, "reactions") {
+                clear_reactions_notify(&chips);
+            }
         });
 
         let selection = gtk::NoSelection::new(Some(store.clone()));
@@ -2241,6 +2257,17 @@ fn bind_row(list_item: &glib::Object, store: &gio::ListStore, files: &FileStore,
         .expect("row child is a Box");
     let root = row.clone().upcast::<gtk::Widget>();
 
+    // Tear down any stale per-row reactive handlers from the item this recycled
+    // row PREVIOUSLY showed, before any early return below (e.g. album
+    // continuation members return early and would otherwise leave the previous
+    // item's avatar/reactions notify handlers stashed on the pooled widgets).
+    if let Some(avatar) = find::<adw::Avatar>(&root, "avatar") {
+        clear_avatar_notify(&avatar);
+    }
+    if let Some(chips) = find::<gtk::Box>(&root, "reactions") {
+        clear_reactions_notify(&chips);
+    }
+
     let outgoing = item.is_outgoing();
     // Stash the message id on the row so the context-menu gesture can find it.
     row.set_widget_name(&format!("msg-row-{}", item.id()));
@@ -2324,7 +2351,6 @@ fn bind_row(list_item: &glib::Object, store: &gio::ListStore, files: &FileStore,
             clear_sender_binding(&sender);
         }
         if let Some(reactions) = find::<gtk::Box>(&root, "reactions") {
-            clear_reactions_notify(&reactions);
             reactions.set_visible(false);
         }
         // Hide the horizontal content line; also hide the date separator (the
@@ -2435,20 +2461,17 @@ fn bind_row(list_item: &glib::Object, store: &gio::ListStore, files: &FileStore,
         // never for outgoing. In groups the initials fallback uses the sender
         // name; in 1:1 the name is empty and adw::Avatar falls back to a generic
         // person icon, which is fine.
-        // Recycled rows may carry a stale color class and a stale
-        // `notify::avatar-file-id` handler wired to the previous item; drop both
-        // first so this bind starts clean and never cross-wires.
-        clear_avatar_color(&avatar);
-        clear_avatar_notify(&avatar);
+        // (The stale `notify::avatar-file-id` handler from a prior occupant is
+        // already torn down at the top of bind_row, before any early return.)
         if !outgoing {
-            // Deterministic placeholder color keyed on the sender id, using
-            // libadwaita's OWN built-in `.color1`..`.color14` avatar classes.
-            // These are the mechanism AdwAvatar actually honors (a plain custom
-            // `background:` can't beat its built-in `background-image` gradient),
-            // so the color is both stable per-user AND actually renders — unlike
-            // AdwAvatar's text-hash auto-color, which flips as our `text` changes.
-            let n = item.sender_id().rem_euclid(AVATAR_COLOR_COUNT) + 1;
-            avatar.add_css_class(&format!("color{n}"));
+            // Placeholder color: rely on AdwAvatar's OWN built-in text-derived
+            // auto-color (the `.colorN` class it adds from `text`). Our `text` is
+            // STABLE per user — empty in 1:1 (constant) and the sender name in
+            // groups (constant per sender) — so the color never flips. A manual
+            // `.colorN` was pointless: AdwAvatar's auto class always coexists with
+            // and overrides it. Because we `set_text` on every bind, AdwAvatar
+            // re-derives the color for the new occupant, so no clearing is needed
+            // on recycle.
             // Reserve the slot on every incoming row. `text` is a STABLE per-user
             // value (the sender name) so nothing about the avatar varies per
             // message; a resolved custom image (below) overrides the initials.
@@ -2465,11 +2488,24 @@ fn bind_row(list_item: &glib::Object, store: &gio::ListStore, files: &FileStore,
                 // moment the id lands and re-runs the load. We also run it once
                 // now for the already-resolved case. The handler id is stashed on
                 // the avatar and torn down on the next bind (clear_avatar_notify).
+                // The message id this row is bound to; used as the recycle
+                // identity everywhere below (the ListItem's current item must
+                // still match it before we paint).
+                let row_msg_id = item.id();
                 let refresh = {
                     let avatar = avatar.clone();
                     let li = list_item.clone();
                     let files = files.clone();
                     move |item: &MessageObject| {
+                        // Recycle guard: only paint if this row still shows the
+                        // message we bound. `item` here is the emitting object,
+                        // so compare the ListItem's CURRENT item against the id
+                        // captured at bind time.
+                        if li.item().and_downcast::<MessageObject>().map(|m| m.id())
+                            != Some(row_msg_id)
+                        {
+                            return;
+                        }
                         let file_id = item.avatar_file_id();
                         if file_id == 0 {
                             return;
@@ -2479,14 +2515,13 @@ fn bind_row(list_item: &glib::Object, store: &gio::ListStore, files: &FileStore,
                                 avatar.set_custom_image(Some(&texture));
                             }
                         } else {
-                            // Recycle-safe: only paint if this row still holds the
-                            // item we started the download for.
-                            let want = item.id();
+                            // Recycle-safe: only paint if this row still shows the
+                            // message we started the download for.
                             let avatar2 = avatar.clone();
                             let li = li.clone();
                             files.download(file_id, 12, move |path| {
                                 if li.item().and_downcast::<MessageObject>().map(|m| m.id())
-                                    != Some(want)
+                                    != Some(row_msg_id)
                                 {
                                     return;
                                 }
@@ -2499,14 +2534,10 @@ fn bind_row(list_item: &glib::Object, store: &gio::ListStore, files: &FileStore,
                 };
                 // Run once for the value already present at bind time.
                 refresh(&item);
-                // Then react to the async resolution. Only paint if the row still
-                // shows this item when the id lands.
-                let want = item.id();
+                // React to the async resolution; `refresh` itself re-checks that
+                // this row still shows the bound message before painting.
                 let handler = item.connect_notify_local(Some("avatar-file-id"), move |item, _| {
                     let item = item.downcast_ref::<MessageObject>().expect("MessageObject");
-                    if item.id() != want {
-                        return;
-                    }
                     refresh(item);
                 });
                 store_avatar_notify(&avatar, &item, handler);
@@ -2741,8 +2772,14 @@ fn bind_row(list_item: &glib::Object, store: &gio::ListStore, files: &FileStore,
         // Then react to async / live updates on this exact item.
         let chips_ref = chips.clone();
         let target = tap_target;
+        let li = list_item.clone();
         let handler = item.connect_notify_local(Some("reactions"), move |item, _| {
             let item = item.downcast_ref::<MessageObject>().expect("MessageObject");
+            // Recycle guard: skip if this row no longer shows the bound message
+            // (`target` == tap_target == the message id captured at bind time).
+            if li.item().and_downcast::<MessageObject>().map(|m| m.id()) != Some(target) {
+                return;
+            }
             render_reaction_chips(&chips_ref, &item.reactions(), &target);
         });
         store_reactions_notify(&chips, &item, handler);
@@ -2996,14 +3033,6 @@ fn size_picture(picture: &gtk::Picture, width: i32, height: i32) {
     let w = (width as f64 * scale).round() as i32;
     let h = (height as f64 * scale).round() as i32;
     picture.set_size_request(w.max(1), h.max(1));
-}
-
-/// Remove any previously-applied libadwaita `.colorN` class from `avatar` so a
-/// recycled row carries exactly the one class this bind adds (or none).
-fn clear_avatar_color(avatar: &adw::Avatar) {
-    for n in 1..=AVATAR_COLOR_COUNT {
-        avatar.remove_css_class(&format!("color{n}"));
-    }
 }
 
 /// Data key under which the sender avatar stashes its current
