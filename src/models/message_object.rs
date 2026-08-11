@@ -189,6 +189,15 @@ mod imp {
         /// The album/media-group id this message belongs to (0 if not part of an album).
         #[property(get, set, name = "media-album-id")]
         pub media_album_id: Cell<i64>,
+
+        /// Encoded reactions summary for this message, rebuilt into chips by the
+        /// chat view. A GObject property can't hold a `Vec`, so the reaction list is
+        /// flattened to a single string: `emoji|count|chosen` entries joined by `;`
+        /// (chosen = `1` if the current user picked that emoji, else `0`). Empty
+        /// when the message has no reactions. Emitting `notify::reactions` drives a
+        /// reactive rebuild of the chip row (never items_changed).
+        #[property(get, set)]
+        pub reactions: RefCell<String>,
     }
 
     #[glib::object_subclass]
@@ -251,6 +260,19 @@ impl MessageObject {
         }
         self.set_reply_to_id(reply_to_id_of(&msg.reply_to));
         self.apply_content(&msg.content);
+        // Seed the reactions summary from the message's interaction info (may be
+        // absent). Live changes arrive later via `Update::MessageInteractionInfo`,
+        // which calls `set_reactions_from` directly.
+        self.set_reactions_from(msg.interaction_info.as_ref());
+    }
+
+    /// Set the `reactions` property from a message's interaction info. Encodes
+    /// each emoji reaction as `emoji|count|chosen` (chosen = 1/0), joined by
+    /// `;`; custom-emoji and paid reactions are skipped (v1 renders emoji only).
+    /// Setting the property emits `notify::reactions`, which the chat view's
+    /// bound handler uses to rebuild the chip row reactively.
+    pub fn set_reactions_from(&self, info: Option<&types::MessageInteractionInfo>) {
+        self.set_reactions(encode_reactions(info));
     }
 
     /// Replace just the content-derived fields (used for `updateMessageContent`).
@@ -294,6 +316,60 @@ impl MessageObject {
             _ => {}
         }
     }
+}
+
+/// Encode a message's emoji reactions to the flat `reactions` string used by
+/// [`MessageObject`] (`emoji|count|chosen` entries joined by `;`). Non-emoji
+/// reaction types (custom emoji, paid) are omitted — v1 renders plain emoji
+/// only. Returns an empty string when there are no emoji reactions.
+fn encode_reactions(info: Option<&types::MessageInteractionInfo>) -> String {
+    let reactions = match info.and_then(|i| i.reactions.as_ref()) {
+        Some(r) => &r.reactions,
+        None => return String::new(),
+    };
+    let mut parts: Vec<String> = Vec::new();
+    for r in reactions {
+        if let tdlib_rs::enums::ReactionType::Emoji(e) = &r.r#type {
+            let chosen = if r.is_chosen { 1 } else { 0 };
+            parts.push(format!("{}|{}|{}", e.emoji, r.total_count, chosen));
+        }
+    }
+    parts.join(";")
+}
+
+/// One decoded reaction chip: the emoji, its total count, and whether the
+/// current user chose it. Produced by [`decode_reactions`] for the chat
+/// view's chip renderer.
+#[derive(Clone, Debug)]
+pub struct ReactionChip {
+    pub emoji: String,
+    pub count: i32,
+    pub is_chosen: bool,
+}
+
+/// Decode the flat `reactions` string (see [`encode_reactions`]) back into a
+/// list of [`ReactionChip`]s. Malformed entries are skipped defensively.
+pub fn decode_reactions(encoded: &str) -> Vec<ReactionChip> {
+    if encoded.is_empty() {
+        return Vec::new();
+    }
+    encoded
+        .split(';')
+        .filter_map(|entry| {
+            let mut it = entry.splitn(3, '|');
+            let emoji = it.next()?.to_string();
+            let count = it.next()?.parse::<i32>().ok()?;
+            let is_chosen = it.next()? == "1";
+            if emoji.is_empty() {
+                return None;
+            }
+            Some(ReactionChip {
+                emoji,
+                count,
+                is_chosen,
+            })
+        })
+        .collect()
 }
 
 /// Flatten a [`MessageSender`] to its numeric id.

@@ -202,6 +202,41 @@ const APP_CSS: &str = "
     font-size: 0.95em;
     min-width: 48px;
 }
+
+/* --- Reaction chips (below a bubble) + emoji picker --- */
+.msg-reactions {
+    margin-top: 2px;
+}
+.msg-reaction-chip {
+    min-height: 0;
+    padding: 1px 8px;
+    border-radius: 9999px;
+    font-size: 0.85em;
+    background-color: alpha(@card_fg_color, 0.1);
+    color: @window_fg_color;
+    border: none;
+    box-shadow: none;
+}
+.msg-reaction-chip.chosen {
+    background-color: @accent_bg_color;
+    color: @accent_fg_color;
+}
+.msg-out .msg-reaction-chip {
+    background-color: alpha(@accent_fg_color, 0.18);
+    color: @accent_fg_color;
+}
+.msg-out .msg-reaction-chip.chosen {
+    background-color: @accent_fg_color;
+    color: @accent_bg_color;
+}
+.msg-reaction-picker {
+    padding: 2px;
+}
+.msg-reaction-pick {
+    font-size: 1.3em;
+    padding: 4px 6px;
+    min-width: 0;
+}
 ";
 
 /// Install the app stylesheet. Call once at application startup.

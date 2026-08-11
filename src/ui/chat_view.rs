@@ -50,7 +50,7 @@ use tdlib_rs::types::{
     InputMessageVoiceNote,
 };
 
-use crate::models::message_object::{kind, send_status, send_status_glyph};
+use crate::models::message_object::{decode_reactions, kind, send_status, send_status_glyph};
 use crate::models::MessageObject;
 use crate::tdlib::{FileStore, TdClient};
 use crate::audio::{file_uri, VoiceEvent, VoicePlayer, VoiceRecorder};
@@ -793,6 +793,15 @@ impl ChatView {
                     self.notify_changed(u.message_id);
                 }
             }
+            Update::MessageInteractionInfo(u) if u.chat_id == self.inner.chat_id => {
+                // Live reaction/view changes. Update the object's `reactions`
+                // property; the row's bound `notify::reactions` handler rebuilds
+                // its chips reactively (no items_changed — it doesn't reliably
+                // repaint during update storms).
+                if let Some(obj) = self.inner.index.borrow().get(&u.message_id).cloned() {
+                    obj.set_reactions_from(u.interaction_info.as_ref());
+                }
+            }
             Update::DeleteMessages(u) if u.chat_id == self.inner.chat_id => {
                 if u.from_cache {
                     return;
@@ -1509,6 +1518,90 @@ impl ChatView {
         self.inner.entry.grab_focus();
     }
 
+    /// Pop a small fixed emoji picker anchored at (`x`,`y`) in the list view.
+    /// Tapping an emoji toggles the current user's reaction on `message_id`
+    /// (add if absent, remove if already chosen). v1 offers a fixed common set
+    /// rather than fetching the chat's available reactions.
+    fn show_reaction_picker(&self, list_view: &gtk::Widget, message_id: i64, x: f64, y: f64) {
+        const PICKER_EMOJI: [&str; 7] = ["👍", "❤️", "🔥", "🎉", "😁", "😢", "🙏"];
+        let row = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(2)
+            .css_classes(["msg-reaction-picker"])
+            .build();
+        let popover = gtk::Popover::builder().has_arrow(false).build();
+        popover.set_parent(list_view);
+        popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+        for emoji in PICKER_EMOJI {
+            let button = gtk::Button::builder()
+                .label(emoji)
+                .css_classes(["flat", "msg-reaction-pick"])
+                .build();
+            let this = self.clone();
+            let popover = popover.clone();
+            let emoji = emoji.to_string();
+            button.connect_clicked(move |_| {
+                this.toggle_reaction(message_id, emoji.clone());
+                popover.popdown();
+            });
+            row.append(&button);
+        }
+        popover.set_child(Some(&row));
+        // Detach from the widget tree once dismissed.
+        popover.connect_closed(|p| p.unparent());
+        popover.popup();
+    }
+
+    /// Toggle the current user's reaction `emoji` on `message_id`: remove it if
+    /// the message's current reactions show the user already chose it, otherwise
+    /// add it. The resulting `Update::MessageInteractionInfo` re-renders the
+    /// chips reactively.
+    fn toggle_reaction(&self, message_id: i64, emoji: String) {
+        // Is this emoji currently chosen by us on this message? Read the live
+        // object's decoded reactions.
+        let already_chosen = self
+            .inner
+            .index
+            .borrow()
+            .get(&message_id)
+            .map(|obj| {
+                decode_reactions(&obj.reactions())
+                    .into_iter()
+                    .any(|c| c.emoji == emoji && c.is_chosen)
+            })
+            .unwrap_or(false);
+
+        let cid = self.inner.client.client_id();
+        let chat_id = self.inner.chat_id;
+        let reaction_type = tdlib_rs::enums::ReactionType::Emoji(tdlib_rs::types::ReactionTypeEmoji {
+            emoji,
+        });
+        if already_chosen {
+            crate::runtime::spawn(
+                async move {
+                    functions::remove_message_reaction(chat_id, message_id, reaction_type, cid).await
+                },
+                |res| {
+                    if let Err(e) = res {
+                        tracing::warn!(code = e.code, msg = %e.message, "remove_message_reaction failed");
+                    }
+                },
+            );
+        } else {
+            crate::runtime::spawn(
+                async move {
+                    functions::add_message_reaction(chat_id, message_id, reaction_type, false, true, cid)
+                        .await
+                },
+                |res| {
+                    if let Err(e) = res {
+                        tracing::warn!(code = e.code, msg = %e.message, "add_message_reaction failed");
+                    }
+                },
+            );
+        }
+    }
+
     /// Disarm the compose reply-strip.
     fn clear_reply(&self) {
         self.inner.reply_to.set(0);
@@ -1636,6 +1729,27 @@ impl ChatView {
             }
         });
         self.inner.list_view.add_controller(tap);
+
+        // Reaction chips (in the list rows) toggle the user's reaction via this
+        // durable action, parameterized by (message_id, emoji). Registered once
+        // on the list view so it resolves for every row's chip buttons.
+        let toggle = gio::SimpleAction::new(
+            "toggle-reaction",
+            Some(glib::VariantTy::new("(xs)").expect("valid variant type")),
+        );
+        {
+            let this = self.clone();
+            toggle.connect_activate(move |_, param| {
+                if let Some((message_id, emoji)) =
+                    param.and_then(|v| v.get::<(i64, String)>())
+                {
+                    this.toggle_reaction(message_id, emoji);
+                }
+            });
+        }
+        let group = gio::SimpleActionGroup::new();
+        group.add_action(&toggle);
+        self.inner.list_view.insert_action_group("react", Some(&group));
     }
 
     /// If (`x`,`y`) is over a photo `gtk::Picture`, open it in a viewer dialog.
@@ -1714,14 +1828,24 @@ impl ChatView {
         };
 
         let menu = gio::Menu::new();
+        menu.append(Some("React…"), Some("msg.react"));
         menu.append(Some("Reply"), Some("msg.reply"));
         menu.append(Some("Copy"), Some("msg.copy"));
         menu.append(Some("Delete"), Some("msg.delete"));
 
         let group = gio::SimpleActionGroup::new();
+        let react = gio::SimpleAction::new("react", None);
         let reply = gio::SimpleAction::new("reply", None);
         let copy = gio::SimpleAction::new("copy", None);
         let delete = gio::SimpleAction::new("delete", None);
+        {
+            let this = self.clone();
+            // Anchor the picker at the tapped point in the list view.
+            let list_view = list_view.clone();
+            react.connect_activate(move |_, _| {
+                this.show_reaction_picker(&list_view, message_id, x, y);
+            });
+        }
         {
             let this = self.clone();
             reply.connect_activate(move |_, _| this.start_reply(message_id));
@@ -1734,6 +1858,7 @@ impl ChatView {
             let this = self.clone();
             delete.connect_activate(move |_, _| this.delete_message(message_id));
         }
+        group.add_action(&react);
         group.add_action(&reply);
         group.add_action(&copy);
         group.add_action(&delete);
@@ -2082,6 +2207,19 @@ fn build_row(_: &gtk::SignalListItemFactory, list_item: &glib::Object) {
 
     bubble.append(&footer);
 
+    // Reaction chips row (emoji + count), rendered BELOW the footer inside the
+    // bubble; hidden unless the message carries reactions. `bind_row` fills it
+    // from the item's `reactions` property and rebuilds it reactively on
+    // `notify::reactions`. Horizontal so multiple chips sit in a line.
+    let reactions = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(4)
+        .build();
+    reactions.add_css_class("msg-reactions");
+    reactions.set_widget_name("reactions");
+    reactions.set_visible(false);
+    bubble.append(&reactions);
+
     hbox.append(&bubble);
     row.append(&hbox);
     list_item.set_child(Some(&row));
@@ -2106,6 +2244,10 @@ fn bind_row(list_item: &glib::Object, store: &gio::ListStore, files: &FileStore,
     let outgoing = item.is_outgoing();
     // Stash the message id on the row so the context-menu gesture can find it.
     row.set_widget_name(&format!("msg-row-{}", item.id()));
+    // Message id captured by reaction chip taps (each chip toggles the user's
+    // reaction on its emoji). Resolved to the ChatView action group via the
+    // list view's `react.toggle-reaction` action (see `wire_row_menu`).
+    let tap_target = item.id();
 
     // Grouping: look at neighbours in the model (list positions, not ids, since
     // the store is already ascending-sorted by id === chronological).
@@ -2180,6 +2322,10 @@ fn bind_row(list_item: &glib::Object, store: &gio::ListStore, files: &FileStore,
         }
         if let Some(sender) = find::<gtk::Label>(&root, "sender") {
             clear_sender_binding(&sender);
+        }
+        if let Some(reactions) = find::<gtk::Box>(&root, "reactions") {
+            clear_reactions_notify(&reactions);
+            reactions.set_visible(false);
         }
         // Hide the horizontal content line; also hide the date separator (the
         // album's first member owns the date).
@@ -2581,6 +2727,26 @@ fn bind_row(list_item: &glib::Object, store: &gio::ListStore, files: &FileStore,
             status.set_text("");
         }
     }
+
+    // Reaction chips: rebuild the chip row from the item's `reactions` property
+    // now, and install a `notify::reactions` handler so live changes (arriving
+    // via `Update::MessageInteractionInfo`) re-render the chips reactively —
+    // items_changed does NOT reliably repaint rows during update storms. The
+    // handler is stashed on the chips box and torn down on the next bind
+    // (clear_reactions_notify), so a recycled row never reacts to a stale item.
+    if let Some(chips) = find::<gtk::Box>(&root, "reactions") {
+        clear_reactions_notify(&chips);
+        // Render whatever is already present at bind time.
+        render_reaction_chips(&chips, &item.reactions(), &tap_target);
+        // Then react to async / live updates on this exact item.
+        let chips_ref = chips.clone();
+        let target = tap_target;
+        let handler = item.connect_notify_local(Some("reactions"), move |item, _| {
+            let item = item.downcast_ref::<MessageObject>().expect("MessageObject");
+            render_reaction_chips(&chips_ref, &item.reactions(), &target);
+        });
+        store_reactions_notify(&chips, &item, handler);
+    }
 }
 
 /// Wire the voice row's play/pause button and seekable scale, with recycle-safe
@@ -2864,6 +3030,68 @@ fn clear_avatar_notify(avatar: &adw::Avatar) {
         {
             item.disconnect(handler);
         }
+    }
+}
+
+/// Data key under which a row's reaction-chips box stashes its live
+/// `notify::reactions` `SignalHandlerId` (plus the object it is connected to),
+/// disconnected before a rebind installs a fresh handler so recycled rows never
+/// accumulate handlers or cross-wire to a stale MessageObject.
+const REACTIONS_NOTIFY_KEY: &str = "paloma-reactions-notify";
+
+/// Stash the chips box's live `reactions` notify handler (replacing any prior
+/// one, which is disconnected first).
+fn store_reactions_notify(chips: &gtk::Box, item: &MessageObject, handler: glib::SignalHandlerId) {
+    clear_reactions_notify(chips);
+    unsafe {
+        chips.set_data(REACTIONS_NOTIFY_KEY, (item.clone(), handler));
+    }
+}
+
+/// Disconnect and drop any `reactions` notify handler previously stashed on
+/// `chips`, so a recycled row stops reacting to its old MessageObject.
+fn clear_reactions_notify(chips: &gtk::Box) {
+    unsafe {
+        if let Some((item, handler)) =
+            chips.steal_data::<(MessageObject, glib::SignalHandlerId)>(REACTIONS_NOTIFY_KEY)
+        {
+            item.disconnect(handler);
+        }
+    }
+}
+
+/// Rebuild the reaction-chips row `chips` from the encoded `reactions` string.
+/// Clears any existing chip buttons, then adds one button per emoji reaction
+/// (emoji + count), highlighting chips the current user chose. Each chip
+/// activates `react.toggle-reaction` with a `(message_id, emoji)` target, so a
+/// tap toggles the user's reaction on that emoji. The whole row is hidden when
+/// the message has no reactions.
+fn render_reaction_chips(chips: &gtk::Box, encoded: &str, message_id: &i64) {
+    // Clear previously-rendered chips (recycled row / live update).
+    while let Some(child) = chips.first_child() {
+        chips.remove(&child);
+    }
+    let decoded = decode_reactions(encoded);
+    if decoded.is_empty() {
+        chips.set_visible(false);
+        return;
+    }
+    chips.set_visible(true);
+    for chip in decoded {
+        let label = format!("{} {}", chip.emoji, chip.count);
+        let button = gtk::Button::builder()
+            .label(&label)
+            .css_classes(["msg-reaction-chip"])
+            .build();
+        if chip.is_chosen {
+            button.add_css_class("chosen");
+        }
+        // Toggle the current user's reaction on this emoji via the list view's
+        // `react.toggle-reaction` action, parameterized by (message_id, emoji).
+        let target = (*message_id, chip.emoji.clone()).to_variant();
+        button.set_action_name(Some("react.toggle-reaction"));
+        button.set_action_target_value(Some(&target));
+        chips.append(&button);
     }
 }
 
