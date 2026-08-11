@@ -114,6 +114,11 @@ struct Inner {
     reply_to: Cell<i64>,
     /// The message id we're currently editing, or 0 when not editing.
     editing: Cell<i64>,
+    /// Generation counter bumped on EVERY compose-state transition (enter/exit
+    /// edit, start/clear reply). An async permission check captures the current
+    /// value before awaiting and bails on resolve if it changed — so a stale
+    /// `get_message_properties` result can't arm edit mode over a newer state.
+    compose_gen: Cell<u64>,
     list_view: gtk::ListView,
     scroller: gtk::ScrolledWindow,
     entry: gtk::TextView,
@@ -147,6 +152,10 @@ struct Inner {
     /// action bumps it and arms a fresh 6s clear; only the latest-armed timeout
     /// actually clears, so a refreshing peer never prematurely blanks the status.
     typing_gen: Cell<u64>,
+    /// In-flight reaction toggles keyed by `(message_id, emoji)`. A second
+    /// toggle for the same key while the first request is outstanding is
+    /// dropped, so a rapid double-tap can't fire add+add (or race add/remove).
+    reaction_inflight: RefCell<HashSet<(i64, String)>>,
 }
 
 impl ChatView {
@@ -447,6 +456,7 @@ impl ChatView {
             loading_older: Cell::new(false),
             reply_to: Cell::new(0),
             editing: Cell::new(0),
+            compose_gen: Cell::new(0),
             list_view,
             scroller,
             entry,
@@ -462,6 +472,7 @@ impl ChatView {
             last_read_outbox: Cell::new(0),
             last_typing_sent: Cell::new(0),
             typing_gen: Cell::new(0),
+            reaction_inflight: RefCell::new(HashSet::new()),
         });
 
         let this = ChatView {
@@ -967,11 +978,20 @@ impl ChatView {
         self.inner.header_title.set_subtitle(subtitle);
     }
 
-    /// Remove a message row by id, if present.
+    /// Remove a deleted message's row + index entry, disarming compose if it was
+    /// the edit/reply target.
     fn remove_message(&self, id: i64) {
         let removed = self.inner.index.borrow_mut().remove(&id);
         if removed.is_none() {
             return;
+        }
+        // If the deleted message was the current compose target, disarm the
+        // compose state so we don't edit/reply-to a now-invalid message.
+        if self.inner.editing.get() == id {
+            self.exit_edit_ui();
+        }
+        if self.inner.reply_to.get() == id {
+            self.clear_reply();
         }
         let store = &self.inner.store;
         let n = store.n_items();
@@ -1595,6 +1615,8 @@ impl ChatView {
 
     /// Arm the compose reply-strip to reply to `message_id`.
     fn start_reply(&self, message_id: i64) {
+        // Compose state changes; invalidate any in-flight async compose callback.
+        self.inner.compose_gen.set(self.inner.compose_gen.get().wrapping_add(1));
         let obj = match self.inner.index.borrow().get(&message_id).cloned() {
             Some(o) => o,
             None => return,
@@ -1623,6 +1645,8 @@ impl ChatView {
     /// (add if absent, remove if already chosen). v1 offers a fixed common set
     /// rather than fetching the chat's available reactions.
     fn show_reaction_picker(&self, list_view: &gtk::Widget, message_id: i64, x: f64, y: f64) {
+        // TODO: populate from getMessageAvailableReactions per chat — a chat may
+        // restrict which reactions are allowed, so a fixed set can silently no-op.
         const PICKER_EMOJI: [&str; 7] = ["👍", "❤️", "🔥", "🎉", "😁", "😢", "🙏"];
         let row = gtk::Box::builder()
             .orientation(gtk::Orientation::Horizontal)
@@ -1671,31 +1695,46 @@ impl ChatView {
             })
             .unwrap_or(false);
 
+        // Drop a duplicate toggle for the same (message, emoji) while the first
+        // request is still outstanding; otherwise a fast double-tap fires the
+        // same add/remove twice instead of cancelling.
+        let key = (message_id, emoji.clone());
+        if !self.inner.reaction_inflight.borrow_mut().insert(key.clone()) {
+            return;
+        }
+
         let cid = self.inner.client.client_id();
         let chat_id = self.inner.chat_id;
         let reaction_type = tdlib_rs::enums::ReactionType::Emoji(tdlib_rs::types::ReactionTypeEmoji {
             emoji,
         });
         if already_chosen {
+            let this = self.clone();
+            let key = key.clone();
             crate::runtime::spawn(
                 async move {
                     functions::remove_message_reaction(chat_id, message_id, reaction_type, cid).await
                 },
-                |res| {
+                move |res| {
+                    this.inner.reaction_inflight.borrow_mut().remove(&key);
                     if let Err(e) = res {
                         tracing::warn!(code = e.code, msg = %e.message, "remove_message_reaction failed");
+                        crate::ui::toast(&this.inner.toasts, "Couldn't remove reaction");
                     }
                 },
             );
         } else {
+            let this = self.clone();
             crate::runtime::spawn(
                 async move {
                     functions::add_message_reaction(chat_id, message_id, reaction_type, false, true, cid)
                         .await
                 },
-                |res| {
+                move |res| {
+                    this.inner.reaction_inflight.borrow_mut().remove(&key);
                     if let Err(e) = res {
                         tracing::warn!(code = e.code, msg = %e.message, "add_message_reaction failed");
+                        crate::ui::toast(&this.inner.toasts, "Couldn't add reaction");
                     }
                 },
             );
@@ -1704,21 +1743,39 @@ impl ChatView {
 
     /// Disarm the compose reply-strip.
     fn clear_reply(&self) {
+        // Compose state changes; invalidate any in-flight async compose callback.
+        self.inner.compose_gen.set(self.inner.compose_gen.get().wrapping_add(1));
         self.inner.reply_to.set(0);
         self.inner.reply_bar.set_reveal_child(false);
     }
 
     /// Begin editing `message_id` if TDLib says it's editable (gate mirrors
-    /// `delete_message`'s `get_message_properties` check).
+    /// `delete_message`'s `get_message_properties` check) AND the message is a
+    /// plain-text message. Versioned against `compose_gen` so a slow permission
+    /// check can't arm edit mode over a newer reply/edit/draft state.
     fn begin_edit(&self, message_id: i64) {
         let cid = self.inner.client.client_id();
         let chat_id = self.inner.chat_id;
+        let gen = self.inner.compose_gen.get();
         let this = self.clone();
         crate::runtime::spawn(
             async move { functions::get_message_properties(chat_id, message_id, cid).await },
             move |res| match res {
                 Ok(MessagePropsEnum::MessageProperties(p)) => {
-                    if p.can_be_edited {
+                    // Bail if the compose state moved on while we awaited.
+                    if this.inner.compose_gen.get() != gen {
+                        return;
+                    }
+                    // Only plain-text messages take the text-edit path; editable
+                    // media / captions / polls would fail an `edit_message_text`.
+                    let is_text = this
+                        .inner
+                        .index
+                        .borrow()
+                        .get(&message_id)
+                        .map(|obj| obj.kind() == kind::TEXT)
+                        .unwrap_or(false);
+                    if p.can_be_edited && is_text {
                         this.enter_edit_mode(message_id);
                     }
                 }
@@ -1730,6 +1787,8 @@ impl ChatView {
     /// Arm edit mode: prefill the compose entry with the message body and reveal
     /// the edit strip. Sending now edits `message_id` instead of composing anew.
     fn enter_edit_mode(&self, message_id: i64) {
+        // Compose state changes; invalidate any in-flight async compose callback.
+        self.inner.compose_gen.set(self.inner.compose_gen.get().wrapping_add(1));
         let obj = match self.inner.index.borrow().get(&message_id).cloned() {
             Some(o) => o,
             None => return,
@@ -1750,6 +1809,8 @@ impl ChatView {
 
     /// Tear down the edit strip and clear the compose entry.
     fn exit_edit_ui(&self) {
+        // Compose state changes; invalidate any in-flight async compose callback.
+        self.inner.compose_gen.set(self.inner.compose_gen.get().wrapping_add(1));
         self.inner.editing.set(0);
         self.inner.edit_bar.set_reveal_child(false);
         self.inner.entry.buffer().set_text("");
@@ -1761,6 +1822,11 @@ impl ChatView {
     }
 
     /// Commit the compose entry as an edit of `message_id` via `edit_message_text`.
+    /// Builds the `InputMessageText` identically to a normal outgoing send
+    /// ([`do_send`]) so an edit never strips formatting or alters link previews
+    /// beyond what a fresh send would. The edit-mode UI is torn down only once
+    /// TDLib accepts the edit; on failure the compose text stays put so the
+    /// user's edit isn't lost.
     fn do_edit(&self, message_id: i64) {
         let buffer = self.inner.entry.buffer();
         let (start, end) = buffer.bounds();
@@ -1772,6 +1838,9 @@ impl ChatView {
         }
         let cid = self.inner.client.client_id();
         let chat_id = self.inner.chat_id;
+        // Mirror `do_send`'s InputMessageText exactly (same empty entities, same
+        // no link-preview override). `clear_draft` is false because an edit does
+        // not consume the compose draft the way a fresh send does.
         let content = InputMessageContent::InputMessageText(InputMessageText {
             text: FormattedText {
                 text,
@@ -1780,14 +1849,20 @@ impl ChatView {
             link_preview_options: None,
             clear_draft: false,
         });
-        // Reset the compose UI before the request resolves; the resulting
-        // `updateMessageContent` repaints the row in place.
-        self.exit_edit_ui();
+        let this = self.clone();
         crate::runtime::spawn(
             async move { functions::edit_message_text(chat_id, message_id, content, cid).await },
-            |res| {
-                if let Err(e) = res {
+            move |res| match res {
+                Ok(_) => {
+                    // Only now tear down the strip + clear the entry; the
+                    // resulting `updateMessageContent` repaints the row in place.
+                    this.exit_edit_ui();
+                }
+                Err(e) => {
+                    // Keep edit mode armed and the user's text intact so the edit
+                    // can be retried; surface the failure.
                     tracing::warn!(code = e.code, msg = %e.message, "edit_message_text failed");
+                    crate::ui::toast(&this.inner.toasts, "Couldn't edit message");
                 }
             },
         );
@@ -1918,9 +1993,18 @@ impl ChatView {
                 .await
             },
             move |res| match res {
-                Ok(_) => crate::ui::toast(&this.inner.toasts, "Forwarded"),
+                Ok(Messages::Messages(m)) => {
+                    // `messages` elements are nullable: a `None` means TDLib
+                    // couldn't forward that message (e.g. content restricted).
+                    if m.messages.first().map(Option::is_some).unwrap_or(false) {
+                        crate::ui::toast(&this.inner.toasts, "Forwarded");
+                    } else {
+                        crate::ui::toast(&this.inner.toasts, "Couldn't forward");
+                    }
+                }
                 Err(e) => {
                     tracing::warn!(code = e.code, msg = %e.message, "forward_messages failed");
+                    crate::ui::toast(&this.inner.toasts, "Couldn't forward");
                 }
             },
         );
@@ -2148,7 +2232,18 @@ impl ChatView {
         let menu = gio::Menu::new();
         menu.append(Some("React…"), Some("msg.react"));
         menu.append(Some("Reply"), Some("msg.reply"));
-        menu.append(Some("Edit"), Some("msg.edit"));
+        // Edit only applies to plain-text messages; `begin_edit` still confirms
+        // `can_be_edited` asynchronously before arming the compose strip.
+        let is_text = self
+            .inner
+            .index
+            .borrow()
+            .get(&message_id)
+            .map(|obj| obj.kind() == kind::TEXT)
+            .unwrap_or(false);
+        if is_text {
+            menu.append(Some("Edit"), Some("msg.edit"));
+        }
         menu.append(Some("Copy"), Some("msg.copy"));
         menu.append(Some("Forward"), Some("msg.forward"));
         menu.append(Some("Delete"), Some("msg.delete"));
