@@ -2219,28 +2219,38 @@ impl ChatView {
     /// the reaction bar and chips already use reliably.
     fn popup_menu_at(&self, list_view: &gtk::Widget, x: f64, y: f64) {
         let message_id = match self.message_id_at(list_view, x, y) {
-            Some(id) => id,
-            None => return,
+            Some(id) => {
+                tracing::info!(id, x, y, "context-menu: row found");
+                id
+            }
+            None => {
+                tracing::info!(x, y, "context-menu: NO row under pointer");
+                return;
+            }
         };
 
         // Common fast-react set, mirrored from the old picker. Tapping one
         // toggles the current user's reaction and dismisses the popover.
         const PICKER_EMOJI: [&str; 7] = ["👍", "❤️", "🔥", "🎉", "😁", "😢", "🙏"];
 
-        // Parent the popover to the ScrolledWindow, NOT to the scrollable list
-        // content. Parenting to the list makes GTK scroll the list to fit this
-        // tall popover, throwing the menu off-screen on long chats (which also
-        // made long-press look dead). The ScrolledWindow's own position doesn't
-        // move when its child scrolls, so it's a stable anchor. Because the
-        // anchor changes, the (x,y) picked in list-view space must be translated
-        // into the ScrolledWindow's coordinate space for `set_pointing_to`
-        // (fall back to the raw coords if translation is unavailable).
+        // Parent the popover to the non-scrolling ROOT (the outermost
+        // ToolbarView), NOT to the list or even the ScrolledWindow. A
+        // ScrolledWindow is itself a scroll container: showing/parenting a tall
+        // popover there still scrolls its content, which trips `wire_scroll_paging`
+        // near the top and prepends older history — the big "jump up" with no
+        // menu. The root never scrolls, so a popover parented to it can't move
+        // the message list. Because the anchor changes, the (x,y) picked in
+        // list-view space must be translated into the root's coordinate space for
+        // `set_pointing_to` (fall back to the raw coords if translation is
+        // unavailable).
         let (tx, ty) = list_view
-            .translate_coordinates(&self.inner.scroller, x, y)
+            .translate_coordinates(&self.root, x, y)
             .unwrap_or((x, y));
 
+        tracing::info!(tx, ty, "context-menu: popover pointing (root coords), popping up");
+
         let popover = gtk::Popover::builder().has_arrow(false).build();
-        popover.set_parent(&self.inner.scroller);
+        popover.set_parent(&self.root);
         popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(tx as i32, ty as i32, 1, 1)));
 
         let container = gtk::Box::builder()
