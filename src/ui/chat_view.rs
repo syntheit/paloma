@@ -161,6 +161,12 @@ struct Inner {
     /// `wire_scroll_paging` and prepend older history (a spurious "jump up").
     /// Set when the menu opens, cleared ~300ms after it closes; guards paging.
     suppress_paging: std::cell::Cell<bool>,
+    /// The currently-open message context-menu popover, if any. The popover is
+    /// non-autohide (so long-press's button-release can't dismiss it as an
+    /// outside event), so we dismiss it explicitly: on a new open, on Escape,
+    /// and on an outside click (see the outside-click gesture in
+    /// `wire_row_menu`). Cleared in the popover's `connect_closed`.
+    menu_popover: std::cell::RefCell<Option<gtk::Popover>>,
 }
 
 impl ChatView {
@@ -482,6 +488,7 @@ impl ChatView {
             typing_gen: Cell::new(0),
             reaction_inflight: RefCell::new(HashSet::new()),
             suppress_paging: std::cell::Cell::new(false),
+            menu_popover: std::cell::RefCell::new(None),
         });
 
         let this = ChatView {
@@ -2128,6 +2135,35 @@ impl ChatView {
         });
         self.inner.list_view.add_controller(tap);
 
+        // Outside-click dismissal for the (non-autohide) context menu. Installed
+        // once, on the outermost root so it covers the whole chat area. Capture
+        // phase so it fires before the popover's own action buttons — the
+        // inside-check below must therefore be correct, or clicking an action
+        // button would popdown the menu before its `clicked` handler runs. We
+        // never consume the event (no `set_state`), so a click that dismisses
+        // the menu still proceeds to whatever is under it.
+        let outside = gtk::GestureClick::new();
+        outside.set_button(0); // all buttons
+        outside.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let this = self.clone();
+        outside.connect_pressed(move |_gesture, _n, x, y| {
+            let Some(pop) = this.inner.menu_popover.borrow().clone() else {
+                return;
+            };
+            // The gesture is on `self.root`, so (x,y) are in root space; ask for
+            // the popover's rect in that SAME space and hit-test the point. A
+            // press inside the popover (e.g. an action button) returns early so
+            // the button's own handler runs; anything else dismisses the menu.
+            if let Some(bounds) = pop.compute_bounds(&this.root) {
+                let point = gtk::graphene::Point::new(x as f32, y as f32);
+                if bounds.contains_point(&point) {
+                    return; // inside the menu: let the button handle it
+                }
+            }
+            pop.popdown();
+        });
+        self.root.add_controller(outside);
+
         // Reaction chips (in the list rows) toggle the user's reaction via this
         // durable action, parameterized by (message_id, emoji). Registered once
         // on the list view so it resolves for every row's chip buttons.
@@ -2245,6 +2281,13 @@ impl ChatView {
         // Cleared ~300ms after the popover closes (see `connect_closed`).
         self.inner.suppress_paging.set(true);
 
+        // Close any menu already open before building a new one (e.g. a
+        // long-press while a prior menu lingers). `take()` drops our reference
+        // and `popdown()` runs its `connect_closed` cleanup.
+        if let Some(old) = self.inner.menu_popover.borrow_mut().take() {
+            old.popdown();
+        }
+
         // Common fast-react set, mirrored from the old picker. Tapping one
         // toggles the current user's reaction and dismisses the popover.
         const PICKER_EMOJI: [&str; 7] = ["👍", "❤️", "🔥", "🎉", "😁", "😢", "🙏"];
@@ -2267,7 +2310,27 @@ impl ChatView {
 
         let popover = gtk::Popover::builder().has_arrow(false).build();
         popover.set_parent(&self.root);
+        // Non-autohide: an autohide popover grabs focus and dismisses on the
+        // focus/gesture churn around a right-click, and — fatally for touch —
+        // treats the button-release that ENDS a long-press as an outside click
+        // and closes itself. We dismiss it explicitly instead (Escape, an
+        // outside click, or a new open); see `wire_row_menu`.
+        popover.set_autohide(false);
         popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(tx as i32, ty as i32, 1, 1)));
+
+        // Escape dismisses the menu (autohide is off, so GTK won't do it for us).
+        {
+            let key_ctrl = gtk::EventControllerKey::new();
+            let popover_key = popover.clone();
+            key_ctrl.connect_key_pressed(move |_ctrl, keyval, _keycode, _state| {
+                if keyval == gtk::gdk::Key::Escape {
+                    popover_key.popdown();
+                    return glib::Propagation::Stop;
+                }
+                glib::Propagation::Proceed
+            });
+            popover.add_controller(key_ctrl);
+        }
 
         let container = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
@@ -2495,12 +2558,18 @@ impl ChatView {
             tracing::info!("popover: CLOSED");
             p.set_child(None::<&gtk::Widget>);
             p.unparent();
+            // Drop our tracked reference (guarding re-entrancy: `take()` is fine,
+            // and we must NOT call `popdown()` from within `connect_closed`).
+            inner.menu_popover.borrow_mut().take();
             let inner = inner.clone();
             glib::timeout_add_local_once(std::time::Duration::from_millis(300), move || {
                 inner.suppress_paging.set(false);
             });
         });
         popover.connect_map(|_| tracing::info!("popover: MAPPED (shown)"));
+        // Track the live menu so the outside-click / Escape / new-open paths can
+        // dismiss it explicitly (autohide is off).
+        *self.inner.menu_popover.borrow_mut() = Some(popover.clone());
         let popover_for_show = popover.clone();
         glib::idle_add_local_once(move || {
             popover_for_show.popup();
