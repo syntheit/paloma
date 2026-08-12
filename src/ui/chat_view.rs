@@ -665,11 +665,14 @@ impl ChatView {
 
     /// Page in an older batch, anchored at the oldest loaded id.
     fn load_older_history(&self) {
+        tracing::info!("load_older_history: fired");
         if self.inner.reached_top.get() || self.inner.loading_older.get() {
+            tracing::info!("load_older_history: skipped (already loading / at end)");
             return;
         }
         let from = self.inner.oldest_id.get();
         if from == 0 {
+            tracing::info!("load_older_history: skipped (already loading / at end)");
             return;
         }
         self.inner.loading_older.set(true);
@@ -776,6 +779,7 @@ impl ChatView {
                 let vadj = scroller.vadjustment();
                 let new_upper = vadj.upper();
                 let delta = new_upper - old_upper;
+                tracing::info!("scroll: programmatic set_value (history restore)");
                 vadj.set_value(old_value + delta);
                 // Clear the load-older guard only after the anchor is restored,
                 // so the programmatic set_value above can't re-trigger paging.
@@ -2475,10 +2479,13 @@ impl ChatView {
         // that would otherwise leak the menu (and its ChatView clones) on every
         // open. Do this on close so re-opening rebuilds the menu fresh.
         popover.connect_closed(|p| {
+            tracing::info!("popover: CLOSED");
             p.set_child(None::<&gtk::Widget>);
             p.unparent();
         });
+        popover.connect_map(|_| tracing::info!("popover: MAPPED (shown)"));
         popover.popup();
+        tracing::info!(visible = popover.is_visible(), "popover: popup() returned");
     }
 
     /// The message id of the row under (`x`,`y`) within the list view, if any.
@@ -2504,6 +2511,7 @@ impl ChatView {
         let this = self.clone();
         let vadj = self.inner.scroller.vadjustment();
         vadj.connect_value_changed(move |adj| {
+            tracing::info!(value = adj.value(), page = adj.page_size(), "scroll-paging: value changed");
             if adj.value() <= adj.page_size() * 0.5 {
                 this.load_older_history();
             }
@@ -2534,6 +2542,7 @@ impl ChatView {
 
     /// Scroll the history to the newest message.
     fn scroll_to_bottom(&self) {
+        tracing::info!("scroll_to_bottom: fired");
         let store = self.inner.store.clone();
         let list_view = self.inner.list_view.clone();
         glib::idle_add_local_once(move || {
