@@ -156,6 +156,11 @@ struct Inner {
     /// toggle for the same key while the first request is outstanding is
     /// dropped, so a rapid double-tap can't fire add+add (or race add/remove).
     reaction_inflight: RefCell<HashSet<(i64, String)>>,
+    /// True while a message context-menu popover is being invoked/closed. Its
+    /// transient close-scroll bounces the list to the top, which would trip
+    /// `wire_scroll_paging` and prepend older history (a spurious "jump up").
+    /// Set when the menu opens, cleared ~300ms after it closes; guards paging.
+    suppress_paging: std::cell::Cell<bool>,
 }
 
 impl ChatView {
@@ -476,6 +481,7 @@ impl ChatView {
             last_typing_sent: Cell::new(0),
             typing_gen: Cell::new(0),
             reaction_inflight: RefCell::new(HashSet::new()),
+            suppress_paging: std::cell::Cell::new(false),
         });
 
         let this = ChatView {
@@ -2233,6 +2239,12 @@ impl ChatView {
             }
         };
 
+        // Suppress history paging for the duration of the menu interaction: the
+        // popover's close-scroll transiently bounces the list to the top, which
+        // would otherwise trip `wire_scroll_paging` and prepend older history.
+        // Cleared ~300ms after the popover closes (see `connect_closed`).
+        self.inner.suppress_paging.set(true);
+
         // Common fast-react set, mirrored from the old picker. Tapping one
         // toggles the current user's reaction and dismisses the popover.
         const PICKER_EMOJI: [&str; 7] = ["👍", "❤️", "🔥", "🎉", "😁", "😢", "🙏"];
@@ -2478,13 +2490,21 @@ impl ChatView {
         // breaking the popover→child→button→closure→popover reference cycle
         // that would otherwise leak the menu (and its ChatView clones) on every
         // open. Do this on close so re-opening rebuilds the menu fresh.
-        popover.connect_closed(|p| {
+        let inner = self.inner.clone();
+        popover.connect_closed(move |p| {
             tracing::info!("popover: CLOSED");
             p.set_child(None::<&gtk::Widget>);
             p.unparent();
+            let inner = inner.clone();
+            glib::timeout_add_local_once(std::time::Duration::from_millis(300), move || {
+                inner.suppress_paging.set(false);
+            });
         });
         popover.connect_map(|_| tracing::info!("popover: MAPPED (shown)"));
-        popover.popup();
+        let popover_for_show = popover.clone();
+        glib::idle_add_local_once(move || {
+            popover_for_show.popup();
+        });
         tracing::info!(visible = popover.is_visible(), "popover: popup() returned");
     }
 
@@ -2512,6 +2532,9 @@ impl ChatView {
         let vadj = self.inner.scroller.vadjustment();
         vadj.connect_value_changed(move |adj| {
             tracing::info!(value = adj.value(), page = adj.page_size(), "scroll-paging: value changed");
+            if this.inner.suppress_paging.get() {
+                return;
+            }
             if adj.value() <= adj.page_size() * 0.5 {
                 this.load_older_history();
             }
