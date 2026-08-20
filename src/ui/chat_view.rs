@@ -218,6 +218,9 @@ impl ChatView {
         let selection = gtk::NoSelection::new(Some(store.clone()));
         let list_view = gtk::ListView::new(Some(selection), Some(factory));
         list_view.add_css_class("msg-list");
+        // Rows/labels are non-focusable (see `build_row`); also stop the list
+        // itself from taking focus so a tap never triggers a scroll-to-focus.
+        list_view.set_can_focus(false);
 
         let scroller = gtk::ScrolledWindow::builder()
             .hscrollbar_policy(gtk::PolicyType::Never)
@@ -681,6 +684,7 @@ impl ChatView {
 
     /// Page in an older batch, anchored at the oldest loaded id.
     fn load_older_history(&self) {
+        tracing::info!("load_older_history: fired");
         if self.inner.reached_top.get() || self.inner.loading_older.get() {
             return;
         }
@@ -2684,13 +2688,12 @@ impl ChatView {
 
     /// Scroll the history to the newest message.
     fn scroll_to_bottom(&self) {
-        let store = self.inner.store.clone();
-        let list_view = self.inner.list_view.clone();
+        let vadj = self.inner.scroller.vadjustment();
         glib::idle_add_local_once(move || {
-            let n = store.n_items();
-            if n > 0 {
-                list_view.scroll_to(n - 1, gtk::ListScrollFlags::NONE, None);
-            }
+            tracing::info!(upper = vadj.upper(), value = vadj.value(), "scroll_to_bottom");
+            // Setting to `upper` clamps to (upper - page_size) = the true bottom,
+            // which lands on the newest message reliably (unlike `scroll_to`).
+            vadj.set_value(vadj.upper());
         });
     }
 }
@@ -2777,6 +2780,8 @@ fn build_row(_: &gtk::SignalListItemFactory, list_item: &glib::Object) {
         .orientation(gtk::Orientation::Vertical)
         .build();
     row.set_widget_name("msg-row");
+    row.set_focusable(false);
+    row.set_can_focus(false);
 
     // Date separator pill, centered, shown only on the first row of a new day.
     let date_sep = gtk::Label::builder()
@@ -2785,6 +2790,8 @@ fn build_row(_: &gtk::SignalListItemFactory, list_item: &glib::Object) {
         .build();
     date_sep.set_widget_name("date-sep");
     date_sep.set_visible(false);
+    date_sep.set_focusable(false);
+    date_sep.set_can_focus(false);
     row.append(&date_sep);
 
     // Horizontal line holding the avatar slot and the bubble; the bubble's own
@@ -2828,6 +2835,8 @@ fn build_row(_: &gtk::SignalListItemFactory, list_item: &glib::Object) {
         .single_line_mode(true)
         .build();
     reply_name.set_widget_name("reply-name");
+    reply_name.set_focusable(false);
+    reply_name.set_can_focus(false);
     let reply_text = gtk::Label::builder()
         .css_classes(["msg-reply-text"])
         .xalign(0.0)
@@ -2835,6 +2844,8 @@ fn build_row(_: &gtk::SignalListItemFactory, list_item: &glib::Object) {
         .single_line_mode(true)
         .build();
     reply_text.set_widget_name("reply-text");
+    reply_text.set_focusable(false);
+    reply_text.set_can_focus(false);
     reply_box.append(&reply_name);
     reply_box.append(&reply_text);
     bubble.append(&reply_box);
@@ -2846,6 +2857,8 @@ fn build_row(_: &gtk::SignalListItemFactory, list_item: &glib::Object) {
         .single_line_mode(true)
         .build();
     sender.set_widget_name("sender");
+    sender.set_focusable(false);
+    sender.set_can_focus(false);
     bubble.append(&sender);
 
     // Album (media-group) grid: renders 2+ grouped photos as a tiled grid on
@@ -2918,6 +2931,8 @@ fn build_row(_: &gtk::SignalListItemFactory, list_item: &glib::Object) {
         .max_width_chars(36)
         .build();
     body.set_widget_name("body");
+    body.set_focusable(false);
+    body.set_can_focus(false);
     // Open http/https links (rendered as markup in `bind_row`) in the default
     // handler. Wired once here at setup, not per-bind, so recycling doesn't
     // stack duplicate handlers.
