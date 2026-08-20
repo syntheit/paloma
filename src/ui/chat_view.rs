@@ -2227,8 +2227,9 @@ impl ChatView {
     /// whole screen behind a modal backdrop). A transparent full-area click
     /// catcher sits behind the card so any tap outside it dismisses, without
     /// darkening anything. Overlay margins place the card's top-left corner at
-    /// the tapped point, re-clamped once the card is mapped so it never spills
-    /// off the right/bottom edge. Only one menu is open at a time.
+    /// the tapped point, re-clamped once the card is mapped — and again after the
+    /// async reaction swap resizes the card — so it never spills off the
+    /// right/bottom edge. Only one menu is open at a time.
     fn popup_menu_at(&self, list_view: &gtk::Widget, x: f64, y: f64) {
         let message_id = match self.message_id_at(list_view, x, y) {
             Some(id) => id,
@@ -2263,21 +2264,58 @@ impl ChatView {
 
         // Shared dismissal: remove BOTH overlay children and clear the tracked
         // state. Guarded so the several dismissal paths (catcher tap, an action,
-        // an emoji, Escape) can't double-remove. Holds only local clones, which
-        // drop once the widgets leave the overlay — no permanent refs on Inner,
-        // so no reference cycle keeps the menu alive.
-        let dismiss: Rc<dyn Fn()> = {
-            let overlay = overlay.clone();
-            let catcher = catcher.clone();
-            let menu_box = menu_box.clone();
-            let inner = self.inner.clone();
-            Rc::new(move || {
-                if inner.open_menu.borrow_mut().take().is_some() {
-                    overlay.remove_overlay(&catcher);
-                    overlay.remove_overlay(&menu_box);
+        // an emoji, Escape) can't double-remove. Every widget — and `Inner`
+        // itself — is held WEAKLY here, so the widget→controller→dismiss chain
+        // has no strong back-edge onto a permanent `Inner` field: no reference
+        // cycle keeps the menu alive. If any upgrade fails the widgets are
+        // already gone, so there's nothing left to tear down.
+        let inner_weak = Rc::downgrade(&self.inner);
+        let dismiss: Rc<dyn Fn()> = Rc::new(glib::clone!(
+            #[weak]
+            catcher,
+            #[weak]
+            menu_box,
+            #[weak(rename_to = overlay)]
+            self.inner.overlay,
+            move || {
+                if let Some(inner) = inner_weak.upgrade() {
+                    if inner.open_menu.borrow_mut().take().is_some() {
+                        overlay.remove_overlay(&catcher);
+                        overlay.remove_overlay(&menu_box);
+                    }
                 }
-            })
-        };
+            }
+        ));
+
+        // Clamp the card's overlay margins so it never spills off the right or
+        // bottom edge, treating the CURRENT margins as the desired tap point.
+        // Weakly holds its widgets so it never extends their lifetime; the
+        // parent()-is-none guard makes it a no-op once the menu is torn down.
+        // Run on map (initial layout) AND after the async reaction swap resizes
+        // the card.
+        let clamp: Rc<dyn Fn()> = Rc::new(glib::clone!(
+            #[weak]
+            menu_box,
+            #[weak]
+            overlay,
+            move || {
+                if menu_box.parent().is_none() {
+                    return;
+                }
+                let card_w = menu_box.width();
+                let card_h = menu_box.height();
+                let ov_w = overlay.width();
+                let ov_h = overlay.height();
+                let start = menu_box.margin_start().clamp(0, (ov_w - card_w).max(0));
+                let top = menu_box.margin_top().clamp(0, (ov_h - card_h).max(0));
+                if start != menu_box.margin_start() {
+                    menu_box.set_margin_start(start);
+                }
+                if top != menu_box.margin_top() {
+                    menu_box.set_margin_top(top);
+                }
+            }
+        ));
 
         // Catcher tap (any button) dismisses.
         let catch_click = gtk::GestureClick::new();
@@ -2347,6 +2385,7 @@ impl ChatView {
         let cid = self.inner.client.client_id();
         let chat_id = self.inner.chat_id;
         let bar_async = bar.clone();
+        let clamp_async = clamp.clone();
         crate::runtime::spawn(
             async move {
                 functions::get_message_available_reactions(chat_id, message_id, 8, cid).await
@@ -2389,6 +2428,8 @@ impl ChatView {
                     // synchronous fallback as best effort.
                     if fetched_ok {
                         bar_async.set_visible(false);
+                        // Hiding the bar shrank the card; re-clamp its position.
+                        clamp_async();
                     }
                     return;
                 }
@@ -2415,6 +2456,9 @@ impl ChatView {
                 for e in emoji {
                     add_pick(e);
                 }
+                // The swapped set may have changed the card's size; re-clamp so
+                // it still fits within the overlay.
+                clamp_async();
             },
         );
 
@@ -2505,15 +2549,9 @@ impl ChatView {
         }
         menu_box.append(&delete);
 
-        // Add to the overlay: catcher first (behind), then the card (above it).
-        overlay.add_overlay(&catcher);
-        overlay.add_overlay(&menu_box);
-        *self.inner.open_menu.borrow_mut() = Some((
-            catcher.clone().upcast::<gtk::Widget>(),
-            menu_box.clone().upcast::<gtk::Widget>(),
-        ));
-
         // Position the card's top-left at the tapped point, in overlay space.
+        // Set BEFORE mapping so `clamp` (fired synchronously by add_overlay's
+        // map) starts from the intended tap point rather than a stale margin.
         let (tx, ty) = list_view
             .translate_coordinates(&overlay, x, y)
             .unwrap_or((x, y));
@@ -2523,31 +2561,25 @@ impl ChatView {
         menu_box.set_margin_top(ty);
 
         // Once mapped the card has a real allocation: re-clamp so it never
-        // spills off the right/bottom edge of the overlay. Runs on every map;
-        // cheap and idempotent.
+        // spills off the right/bottom edge of the overlay. Connected BEFORE
+        // add_overlay so the synchronous map fires it. Cheap and idempotent.
         {
-            let overlay = overlay.clone();
-            menu_box.connect_map(move |menu_box| {
-                let (menu_w, menu_h) = (menu_box.width(), menu_box.height());
-                let (ov_w, ov_h) = (overlay.width(), overlay.height());
-                let mut start = menu_box.margin_start();
-                let mut top = menu_box.margin_top();
-                if ov_w > 0 && start + menu_w > ov_w {
-                    start = ov_w - menu_w;
-                }
-                if ov_h > 0 && top + menu_h > ov_h {
-                    top = ov_h - menu_h;
-                }
-                let start = start.max(0);
-                let top = top.max(0);
-                if start != menu_box.margin_start() {
-                    menu_box.set_margin_start(start);
-                }
-                if top != menu_box.margin_top() {
-                    menu_box.set_margin_top(top);
-                }
-            });
+            let clamp = clamp.clone();
+            menu_box.connect_map(move |_| clamp());
         }
+
+        // Add to the overlay: catcher first (behind), then the card (above it).
+        overlay.add_overlay(&catcher);
+        overlay.add_overlay(&menu_box);
+        *self.inner.open_menu.borrow_mut() = Some((
+            catcher.clone().upcast::<gtk::Widget>(),
+            menu_box.clone().upcast::<gtk::Widget>(),
+        ));
+
+        // Make the card focusable and grab focus so its Escape key controller
+        // receives key events.
+        menu_box.set_can_focus(true);
+        menu_box.grab_focus();
     }
 
     /// The message id of the row under (`x`,`y`) within the list view, if any.
