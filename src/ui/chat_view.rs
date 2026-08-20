@@ -2680,6 +2680,22 @@ impl ChatView {
             this.scroll_to_bottom();
         });
 
+        // A `clicked` needs a clean press+release, but an in-flight kinetic /
+        // momentum scroll consumes the release, so tapping the button mid-scroll
+        // does nothing. Add a capture-phase press gesture directly on the button
+        // so it fires the instant the finger lands — even during momentum — and
+        // claims the sequence.
+        let press = gtk::GestureClick::new();
+        press.set_button(0); // any button / touch
+        press.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let this2 = self.clone();
+        press.connect_pressed(move |gesture, _n, _x, _y| {
+            tracing::info!("scroll button: pressed");
+            this2.scroll_to_bottom();
+            gesture.set_state(gtk::EventSequenceState::Claimed);
+        });
+        button.add_controller(press);
+
         // Toggle visibility from the scroll position: hidden within 200px of the
         // bottom, shown otherwise. This is a second handler on the same
         // vadjustment as `wire_scroll_paging` (multiple handlers are fine).
