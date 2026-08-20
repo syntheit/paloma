@@ -156,24 +156,6 @@ struct Inner {
     /// toggle for the same key while the first request is outstanding is
     /// dropped, so a rapid double-tap can't fire add+add (or race add/remove).
     reaction_inflight: RefCell<HashSet<(i64, String)>>,
-    /// True while a message context-menu popover is being invoked/closed. Its
-    /// transient close-scroll bounces the list to the top, which would trip
-    /// `wire_scroll_paging` and prepend older history (a spurious "jump up").
-    /// Set when the menu opens, cleared ~300ms after it closes; guards paging.
-    suppress_paging: std::cell::Cell<bool>,
-    /// The currently-open message context-menu popover, if any. The popover is
-    /// non-autohide (so long-press's button-release can't dismiss it as an
-    /// outside event), so we dismiss it explicitly: on a new open, on Escape,
-    /// and on an outside click (see the outside-click gesture in
-    /// `wire_row_menu`). Cleared in the popover's `connect_closed`.
-    menu_popover: std::cell::RefCell<Option<gtk::Popover>>,
-    /// True for a brief window (~350ms) right after a context menu opens. On
-    /// touch, the long-press that opens the menu is the same continuous touch
-    /// sequence as the "tap", so the outside-click gesture would fire on that
-    /// very press (its point is on the message, outside the just-opened
-    /// popover) and dismiss the menu immediately. While set, the outside-click
-    /// gesture returns early so the opening touch can't close the menu.
-    menu_settle: std::cell::Cell<bool>,
 }
 
 impl ChatView {
@@ -494,9 +476,6 @@ impl ChatView {
             last_typing_sent: Cell::new(0),
             typing_gen: Cell::new(0),
             reaction_inflight: RefCell::new(HashSet::new()),
-            suppress_paging: std::cell::Cell::new(false),
-            menu_popover: std::cell::RefCell::new(None),
-            menu_settle: std::cell::Cell::new(false),
         });
 
         let this = ChatView {
@@ -686,14 +665,11 @@ impl ChatView {
 
     /// Page in an older batch, anchored at the oldest loaded id.
     fn load_older_history(&self) {
-        tracing::info!("load_older_history: fired");
         if self.inner.reached_top.get() || self.inner.loading_older.get() {
-            tracing::info!("load_older_history: skipped (already loading / at end)");
             return;
         }
         let from = self.inner.oldest_id.get();
         if from == 0 {
-            tracing::info!("load_older_history: skipped (already loading / at end)");
             return;
         }
         self.inner.loading_older.set(true);
@@ -800,7 +776,6 @@ impl ChatView {
                 let vadj = scroller.vadjustment();
                 let new_upper = vadj.upper();
                 let delta = new_upper - old_upper;
-                tracing::info!("scroll: programmatic set_value (history restore)");
                 vadj.set_value(old_value + delta);
                 // Clear the load-older guard only after the anchor is restored,
                 // so the programmatic set_value above can't re-trigger paging.
@@ -2143,40 +2118,6 @@ impl ChatView {
         });
         self.inner.list_view.add_controller(tap);
 
-        // Outside-click dismissal for the (non-autohide) context menu. Installed
-        // once, on the outermost root so it covers the whole chat area. Capture
-        // phase so it fires before the popover's own action buttons — the
-        // inside-check below must therefore be correct, or clicking an action
-        // button would popdown the menu before its `clicked` handler runs. We
-        // never consume the event (no `set_state`), so a click that dismisses
-        // the menu still proceeds to whatever is under it.
-        let outside = gtk::GestureClick::new();
-        outside.set_button(0); // all buttons
-        outside.set_propagation_phase(gtk::PropagationPhase::Capture);
-        let this = self.clone();
-        outside.connect_pressed(move |_gesture, _n, x, y| {
-            // Ignore the touch that just opened the menu (see `menu_settle`).
-            if this.inner.menu_settle.get() {
-                return;
-            }
-            let Some(pop) = this.inner.menu_popover.borrow().clone() else {
-                return;
-            };
-            // The gesture is on `self.root`, so (x,y) are in root space; ask for
-            // the popover's rect in that SAME space and hit-test the point. A
-            // press inside the popover (e.g. an action button) returns early so
-            // the button's own handler runs; anything else dismisses the menu.
-            if let Some(bounds) = pop.compute_bounds(&this.root) {
-                let point = gtk::graphene::Point::new(x as f32, y as f32);
-                if bounds.contains_point(&point) {
-                    return; // inside the menu: let the button handle it
-                }
-            }
-            tracing::info!(x, y, "outside-click: dismissing menu");
-            pop.popdown();
-        });
-        self.root.add_controller(outside);
-
         // Reaction chips (in the list rows) toggle the user's reaction via this
         // durable action, parameterized by (message_id, emoji). Registered once
         // on the list view so it resolves for every row's chip buttons.
@@ -2267,95 +2208,42 @@ impl ChatView {
         }
     }
 
-    /// Identify the row under (`x`,`y`) inside the list view and pop a custom
-    /// context popover: a quick-reaction emoji bar on top plus a list of action
-    /// rows below.
+    /// Identify the row under (`x`,`y`) inside the list view and present a
+    /// per-message context menu as an [`adw::Dialog`] — an adaptive bottom sheet
+    /// on mobile / floating dialog on desktop. The (`x`,`y`) are used only to
+    /// find the row; a dialog isn't anchored to a point.
     ///
-    /// This deliberately avoids `gtk::PopoverMenu` + `gio::Action`: on this GTK
-    /// build the `msg.*` menu-model actions never fired (the menu just
-    /// dismissed). Instead every row is a plain `gtk::Button` whose
-    /// `connect_clicked` calls the target method directly — the same approach
-    /// the reaction bar and chips already use reliably.
+    /// A dialog (unlike a popover parented to the non-popover-host `ToolbarView`)
+    /// re-allocates correctly and manages its own dismissal — tap-outside, swipe
+    /// down, Escape, or the back button — so none of the old popover machinery
+    /// (autohide, outside-click gesture, Escape controller, deferred popup,
+    /// paging suppression) is needed. Every row is a plain `gtk::Button` whose
+    /// `connect_clicked` calls the target method directly then closes the dialog.
     fn popup_menu_at(&self, list_view: &gtk::Widget, x: f64, y: f64) {
         let message_id = match self.message_id_at(list_view, x, y) {
-            Some(id) => {
-                tracing::info!(id, x, y, "context-menu: row found");
-                id
-            }
-            None => {
-                tracing::info!(x, y, "context-menu: NO row under pointer");
-                return;
-            }
+            Some(id) => id,
+            None => return,
         };
 
-        // Suppress history paging for the duration of the menu interaction: the
-        // popover's close-scroll transiently bounces the list to the top, which
-        // would otherwise trip `wire_scroll_paging` and prepend older history.
-        // Cleared ~300ms after the popover closes (see `connect_closed`).
-        self.inner.suppress_paging.set(true);
-
-        // Close any menu already open before building a new one (e.g. a
-        // long-press while a prior menu lingers). `take()` drops our reference
-        // and `popdown()` runs its `connect_closed` cleanup.
-        if let Some(old) = self.inner.menu_popover.borrow_mut().take() {
-            old.popdown();
-        }
-
         // Common fast-react set, mirrored from the old picker. Tapping one
-        // toggles the current user's reaction and dismisses the popover.
+        // toggles the current user's reaction and dismisses the dialog.
         const PICKER_EMOJI: [&str; 7] = ["👍", "❤️", "🔥", "🎉", "😁", "😢", "🙏"];
 
-        // Parent the popover to the non-scrolling ROOT (the outermost
-        // ToolbarView), NOT to the list or even the ScrolledWindow. A
-        // ScrolledWindow is itself a scroll container: showing/parenting a tall
-        // popover there still scrolls its content, which trips `wire_scroll_paging`
-        // near the top and prepends older history — the big "jump up" with no
-        // menu. The root never scrolls, so a popover parented to it can't move
-        // the message list. Because the anchor changes, the (x,y) picked in
-        // list-view space must be translated into the root's coordinate space for
-        // `set_pointing_to` (fall back to the raw coords if translation is
-        // unavailable).
-        let (tx, ty) = list_view
-            .translate_coordinates(&self.root, x, y)
-            .unwrap_or((x, y));
-
-        tracing::info!(tx, ty, "context-menu: popover pointing (root coords), popping up");
-
-        let popover = gtk::Popover::builder().has_arrow(false).build();
-        popover.set_parent(&self.root);
-        // Non-autohide: an autohide popover grabs focus and dismisses on the
-        // focus/gesture churn around a right-click, and — fatally for touch —
-        // treats the button-release that ENDS a long-press as an outside click
-        // and closes itself. We dismiss it explicitly instead (Escape, an
-        // outside click, or a new open); see `wire_row_menu`.
-        popover.set_autohide(false);
-        popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(tx as i32, ty as i32, 1, 1)));
-
-        // Escape dismisses the menu (autohide is off, so GTK won't do it for us).
-        {
-            let key_ctrl = gtk::EventControllerKey::new();
-            let popover_key = popover.clone();
-            key_ctrl.connect_key_pressed(move |_ctrl, keyval, _keycode, _state| {
-                if keyval == gtk::gdk::Key::Escape {
-                    popover_key.popdown();
-                    return glib::Propagation::Stop;
-                }
-                glib::Propagation::Proceed
-            });
-            popover.add_controller(key_ctrl);
-        }
+        let dialog = adw::Dialog::new();
+        dialog.set_content_width(360);
 
         let container = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             .css_classes(["msg-menu"])
+            .margin_top(12)
+            .margin_bottom(12)
+            .margin_start(12)
+            .margin_end(12)
             .build();
 
         // --- Quick-reaction emoji bar (pill row on top) ---
-        // Populated synchronously with `PICKER_EMOJI` below so the popover opens
-        // at its final height on the first frame (an empty bar that filled later
-        // would re-fit the popover and scroll the parent list). The async fetch
-        // then swaps the contents in place — a same-height, horizontal-only
-        // change that won't trigger a vertical re-fit.
+        // Seeded synchronously with `PICKER_EMOJI`; the async fetch below swaps
+        // in the chat's actually-available reactions once it resolves.
         let bar = gtk::Box::builder()
             .orientation(gtk::Orientation::Horizontal)
             .spacing(2)
@@ -2364,10 +2252,10 @@ impl ChatView {
         container.append(&bar);
 
         // Append one flat emoji button to `bar` that toggles the reaction and
-        // dismisses the popover. Shared by the sync fallback and the async swap.
+        // closes the dialog. Shared by the sync fallback and the async swap.
         let add_pick = {
             let this = self.clone();
-            let popover = popover.clone();
+            let dialog = dialog.clone();
             let bar = bar.clone();
             move |emoji: String| {
                 let button = gtk::Button::builder()
@@ -2375,16 +2263,16 @@ impl ChatView {
                     .css_classes(["flat", "msg-reaction-pick"])
                     .build();
                 let this = this.clone();
-                let popover = popover.clone();
+                let dialog = dialog.clone();
                 button.connect_clicked(move |_| {
                     this.toggle_reaction(message_id, emoji.clone());
-                    popover.popdown();
+                    dialog.close();
                 });
                 bar.append(&button);
             }
         };
 
-        // Seed the fallback set synchronously so the bar is full-height at popup.
+        // Seed the fallback set synchronously so the bar is full at present.
         for e in PICKER_EMOJI {
             add_pick(e.to_string());
         }
@@ -2404,7 +2292,7 @@ impl ChatView {
             move |res| {
                 // Distinguish a successful fetch (even one yielding no usable
                 // reactions) from an error. On success-but-empty we HIDE the
-                // bar so the popover never offers reactions TDLib will reject
+                // bar so the menu never offers reactions TDLib will reject
                 // ("The reaction isn't available for the message" — the source
                 // of the old "Couldn't add reaction" confusion in restricted
                 // chats like Saved Messages or channels). On an Err we leave the
@@ -2435,10 +2323,8 @@ impl ChatView {
                 }
                 if emoji.is_empty() {
                     // Fetch succeeded but nothing is addable here → hide the bar
-                    // so only the action rows show (this collapses the bar
-                    // cleanly; the popover just opened, and it's parented to the
-                    // ScrolledWindow so it won't scroll the chat). On an errored
-                    // fetch, keep the synchronous fallback as best effort.
+                    // so only the action rows show. On an errored fetch, keep the
+                    // synchronous fallback as best effort.
                     if fetched_ok {
                         bar_async.set_visible(false);
                     }
@@ -2446,8 +2332,6 @@ impl ChatView {
                 }
                 // Skip the swap entirely if the fetched set already matches what's
                 // shown (common: the fetched set equals the synchronous seed).
-                // Clearing to empty then refilling would momentarily collapse the
-                // bar and re-fit the popover (scroll jump), so only swap on change.
                 let current: Vec<String> = {
                     let mut v = Vec::new();
                     let mut child = bar_async.first_child();
@@ -2462,8 +2346,7 @@ impl ChatView {
                 if current == emoji {
                     return;
                 }
-                // Swap the fallback buttons for the fetched set in place. Same
-                // height, so no vertical re-fit; harmless if the popover closed.
+                // Swap the fallback buttons for the fetched set in place.
                 while let Some(child) = bar_async.first_child() {
                     bar_async.remove(&child);
                 }
@@ -2475,7 +2358,7 @@ impl ChatView {
 
         // --- Action rows below the bar ---
         // Each row is an icon + label inside a flat button; clicking invokes the
-        // target method directly then dismisses.
+        // target method directly then closes the dialog.
         let make_item = |icon: &str, label: &str, destructive: bool| -> gtk::Button {
             let content = gtk::Box::builder()
                 .orientation(gtk::Orientation::Horizontal)
@@ -2499,10 +2382,10 @@ impl ChatView {
         let reply = make_item("mail-reply-sender-symbolic", "Reply", false);
         {
             let this = self.clone();
-            let popover = popover.clone();
+            let dialog = dialog.clone();
             reply.connect_clicked(move |_| {
                 this.start_reply(message_id);
-                popover.popdown();
+                dialog.close();
             });
         }
         container.append(&reply);
@@ -2519,10 +2402,10 @@ impl ChatView {
         if is_text {
             let edit = make_item("document-edit-symbolic", "Edit", false);
             let this = self.clone();
-            let popover = popover.clone();
+            let dialog = dialog.clone();
             edit.connect_clicked(move |_| {
                 this.begin_edit(message_id);
-                popover.popdown();
+                dialog.close();
             });
             container.append(&edit);
         }
@@ -2530,10 +2413,10 @@ impl ChatView {
         let copy = make_item("edit-copy-symbolic", "Copy", false);
         {
             let this = self.clone();
-            let popover = popover.clone();
+            let dialog = dialog.clone();
             copy.connect_clicked(move |_| {
                 this.copy_message(message_id);
-                popover.popdown();
+                dialog.close();
             });
         }
         container.append(&copy);
@@ -2541,10 +2424,10 @@ impl ChatView {
         let forward = make_item("mail-forward-symbolic", "Forward", false);
         {
             let this = self.clone();
-            let popover = popover.clone();
+            let dialog = dialog.clone();
             forward.connect_clicked(move |_| {
                 this.forward_message(message_id);
-                popover.popdown();
+                dialog.close();
             });
         }
         container.append(&forward);
@@ -2552,51 +2435,16 @@ impl ChatView {
         let delete = make_item("user-trash-symbolic", "Delete", true);
         {
             let this = self.clone();
-            let popover = popover.clone();
+            let dialog = dialog.clone();
             delete.connect_clicked(move |_| {
                 this.delete_message(message_id);
-                popover.popdown();
+                dialog.close();
             });
         }
         container.append(&delete);
 
-        popover.set_child(Some(&container));
-        // Clearing the child before unparenting drops the button subtree (and
-        // the `popover.clone()` captured by each button's clicked closure),
-        // breaking the popover→child→button→closure→popover reference cycle
-        // that would otherwise leak the menu (and its ChatView clones) on every
-        // open. Do this on close so re-opening rebuilds the menu fresh.
-        let inner = self.inner.clone();
-        popover.connect_closed(move |p| {
-            tracing::info!("popover: CLOSED");
-            p.set_child(None::<&gtk::Widget>);
-            p.unparent();
-            // Drop our tracked reference (guarding re-entrancy: `take()` is fine,
-            // and we must NOT call `popdown()` from within `connect_closed`).
-            inner.menu_popover.borrow_mut().take();
-            let inner = inner.clone();
-            glib::timeout_add_local_once(std::time::Duration::from_millis(300), move || {
-                inner.suppress_paging.set(false);
-            });
-        });
-        popover.connect_map(|_| tracing::info!("popover: MAPPED (shown)"));
-        // Track the live menu so the outside-click / Escape / new-open paths can
-        // dismiss it explicitly (autohide is off).
-        *self.inner.menu_popover.borrow_mut() = Some(popover.clone());
-        // Guard the outside-click gesture from the touch that is opening this
-        // menu: on touch the long-press and its release are one continuous
-        // sequence, so that gesture would otherwise fire on the opening press
-        // and dismiss the menu instantly. Cleared shortly after.
-        self.inner.menu_settle.set(true);
-        let inner_settle = self.inner.clone();
-        glib::timeout_add_local_once(std::time::Duration::from_millis(350), move || {
-            inner_settle.menu_settle.set(false);
-        });
-        let popover_for_show = popover.clone();
-        glib::idle_add_local_once(move || {
-            popover_for_show.popup();
-        });
-        tracing::info!(visible = popover.is_visible(), "popover: popup() returned");
+        dialog.set_child(Some(&container));
+        dialog.present(Some(&self.root));
     }
 
     /// The message id of the row under (`x`,`y`) within the list view, if any.
@@ -2622,10 +2470,6 @@ impl ChatView {
         let this = self.clone();
         let vadj = self.inner.scroller.vadjustment();
         vadj.connect_value_changed(move |adj| {
-            tracing::info!(value = adj.value(), page = adj.page_size(), "scroll-paging: value changed");
-            if this.inner.suppress_paging.get() {
-                return;
-            }
             if adj.value() <= adj.page_size() * 0.5 {
                 this.load_older_history();
             }
@@ -2656,7 +2500,6 @@ impl ChatView {
 
     /// Scroll the history to the newest message.
     fn scroll_to_bottom(&self) {
-        tracing::info!("scroll_to_bottom: fired");
         let store = self.inner.store.clone();
         let list_view = self.inner.list_view.clone();
         glib::idle_add_local_once(move || {
