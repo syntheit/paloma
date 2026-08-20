@@ -432,6 +432,10 @@ impl ChatView {
             .margin_bottom(12)
             .tooltip_text("Scroll to latest")
             .build();
+        // Non-focusable so a click never focuses it (focus would otherwise
+        // cascade to the compose entry and raise the on-screen keyboard).
+        scroll_down.set_focusable(false);
+        scroll_down.set_can_focus(false);
         scroll_down.set_visible(false);
         overlay.add_overlay(&scroll_down);
 
@@ -2667,12 +2671,13 @@ impl ChatView {
     /// Wire the floating "scroll to newest" button: it clicks to the bottom and
     /// hides itself whenever the history is already near the bottom.
     fn wire_scroll_button(&self, button: &gtk::Button) {
-        // Click → jump to the newest message and hide the button.
+        // Click → jump to the newest message. The vadjustment `value-changed`
+        // handler below hides the button once we're within 200px of the bottom,
+        // so no explicit hide is needed here (an explicit hide would cascade
+        // focus to the compose entry and raise the on-screen keyboard).
         let this = self.clone();
-        let btn = button.clone();
         button.connect_clicked(move |_| {
             this.scroll_to_bottom();
-            btn.set_visible(false);
         });
 
         // Toggle visibility from the scroll position: hidden within 200px of the
@@ -2687,14 +2692,42 @@ impl ChatView {
     }
 
     /// Scroll the history to the newest message.
+    ///
+    /// The message list is virtualized, so `vadj.upper()` (total content height)
+    /// is only an estimate until the bottom rows are realized/measured — a single
+    /// `set_value(upper)` undershoots. We set to the bottom now, then re-pin on
+    /// the next few `changed` (range) emissions as the height settles, then stop.
     fn scroll_to_bottom(&self) {
         let vadj = self.inner.scroller.vadjustment();
-        glib::idle_add_local_once(move || {
-            tracing::info!(upper = vadj.upper(), value = vadj.value(), "scroll_to_bottom");
-            // Setting to `upper` clamps to (upper - page_size) = the true bottom,
-            // which lands on the newest message reliably (unlike `scroll_to`).
-            vadj.set_value(vadj.upper());
+        tracing::info!(upper = vadj.upper(), value = vadj.value(), "scroll_to_bottom");
+        vadj.set_value(vadj.upper());
+
+        // Initial idle set-to-upper (after the current layout pass).
+        {
+            let vadj = vadj.clone();
+            glib::idle_add_local_once(move || {
+                vadj.set_value(vadj.upper());
+            });
+        }
+
+        // Re-pin to the bottom as the adjustment's range settles. `changed`
+        // fires on RANGE (lower/upper/page-size) changes — i.e. as content is
+        // measured — NOT on user scroll (that's `value-changed`), so this won't
+        // fight a user scroll. Self-disconnects after a handful of updates.
+        let remaining = std::rc::Rc::new(std::cell::Cell::new(6u8));
+        let id_holder = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let idh = id_holder.clone();
+        let rem = remaining.clone();
+        let id = vadj.connect_changed(move |a| {
+            a.set_value(a.upper());
+            rem.set(rem.get().saturating_sub(1));
+            if rem.get() == 0 {
+                if let Some(id) = idh.borrow_mut().take() {
+                    a.disconnect(id);
+                }
+            }
         });
+        *id_holder.borrow_mut() = Some(id);
     }
 }
 
