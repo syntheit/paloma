@@ -688,7 +688,6 @@ impl ChatView {
 
     /// Page in an older batch, anchored at the oldest loaded id.
     fn load_older_history(&self) {
-        tracing::info!("load_older_history: fired");
         if self.inner.reached_top.get() || self.inner.loading_older.get() {
             return;
         }
@@ -2690,7 +2689,6 @@ impl ChatView {
         press.set_propagation_phase(gtk::PropagationPhase::Capture);
         let this2 = self.clone();
         press.connect_pressed(move |gesture, _n, _x, _y| {
-            tracing::info!("scroll button: pressed");
             this2.scroll_to_bottom();
             gesture.set_state(gtk::EventSequenceState::Claimed);
         });
@@ -2720,7 +2718,6 @@ impl ChatView {
     /// virtualized `upper` has stopped growing — with a safety cap.
     fn scroll_to_bottom(&self) {
         let vadj = self.inner.scroller.vadjustment();
-        tracing::info!(upper = vadj.upper(), value = vadj.value(), "scroll_to_bottom");
         let stable = std::rc::Rc::new(std::cell::Cell::new(0u32));
         let ticks = std::rc::Rc::new(std::cell::Cell::new(0u32));
         glib::timeout_add_local(std::time::Duration::from_millis(16), move || {
