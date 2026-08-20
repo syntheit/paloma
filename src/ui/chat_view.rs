@@ -39,6 +39,7 @@ use gtk::glib::clone;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
+use std::time::Duration;
 
 use tdlib_rs::enums::{
     InputFile, InputMessageContent, InputMessageReplyTo, Message as MessageEnum,
@@ -110,6 +111,10 @@ struct Inner {
     reached_top: Cell<bool>,
     /// Guards against overlapping "load older" requests while one is in flight.
     loading_older: Cell<bool>,
+    /// True while a context menu is open (and briefly after it dismisses), to
+    /// veto scroll-triggered older-history paging: focus/scroll churn around
+    /// the menu must not prepend history and jump the view.
+    suppress_paging: Cell<bool>,
     /// The message id we're composing a reply to, or 0 for a normal message.
     reply_to: Cell<i64>,
     /// The message id we're currently editing, or 0 when not editing.
@@ -465,6 +470,7 @@ impl ChatView {
             oldest_id: Cell::new(0),
             reached_top: Cell::new(false),
             loading_older: Cell::new(false),
+            suppress_paging: Cell::new(false),
             reply_to: Cell::new(0),
             editing: Cell::new(0),
             compose_gen: Cell::new(0),
@@ -2238,6 +2244,11 @@ impl ChatView {
 
         let overlay = self.inner.overlay.clone();
 
+        // Suppress scroll-triggered older-history paging while the menu is up:
+        // the focus/scroll churn around opening the menu must not prepend
+        // history and jump the view. Cleared shortly after dismissal.
+        self.inner.suppress_paging.set(true);
+
         // Only one menu at a time: tear down any menu already open before we
         // build a new one (e.g. a second long-press without dismissing).
         if let Some((catcher, menu_box)) = self.inner.open_menu.borrow_mut().take() {
@@ -2282,6 +2293,12 @@ impl ChatView {
                     if inner.open_menu.borrow_mut().take().is_some() {
                         overlay.remove_overlay(&catcher);
                         overlay.remove_overlay(&menu_box);
+                        // Keep paging vetoed a beat past teardown so the settling
+                        // scroll after the menu closes doesn't page + jump.
+                        let inner2 = inner.clone();
+                        glib::timeout_add_local_once(Duration::from_millis(400), move || {
+                            inner2.suppress_paging.set(false);
+                        });
                     }
                 }
             }
@@ -2496,16 +2513,16 @@ impl ChatView {
         }
         menu_box.append(&reply);
 
-        // Edit only applies to plain-text messages; `begin_edit` still confirms
-        // `can_be_edited` asynchronously before arming the compose strip.
-        let is_text = self
+        // Edit only applies to our OWN plain-text messages; `begin_edit` still
+        // confirms `can_be_edited` asynchronously before arming the compose strip.
+        let is_own_text = self
             .inner
             .index
             .borrow()
             .get(&message_id)
-            .map(|obj| obj.kind() == kind::TEXT)
+            .map(|obj| obj.is_outgoing() && obj.kind() == kind::TEXT)
             .unwrap_or(false);
-        if is_text {
+        if is_own_text {
             let edit = make_item("document-edit-symbolic", "Edit", false);
             let this = self.clone();
             let dismiss = dismiss.clone();
@@ -2576,10 +2593,39 @@ impl ChatView {
             menu_box.clone().upcast::<gtk::Widget>(),
         ));
 
-        // Make the card focusable and grab focus so its Escape key controller
-        // receives key events.
-        menu_box.set_can_focus(true);
-        menu_box.grab_focus();
+        // Hide the Forward/Delete rows that this message can't actually support.
+        // The rows are shown by default (built above) and switched off here once
+        // the permission fetch resolves; a hidden row shrinks the card, so we
+        // re-clamp its position. Widgets are held WEAKLY so the pending request
+        // never extends their lifetime past dismissal, and `clamp` is a
+        // short-lived Rc (not stored on `Inner`) so a strong clone is fine.
+        let cid = self.inner.client.client_id();
+        let chat_id = self.inner.chat_id;
+        let forward_weak = forward.downgrade();
+        let delete_weak = delete.downgrade();
+        let clamp2 = clamp.clone();
+        crate::runtime::spawn(
+            async move { functions::get_message_properties(chat_id, message_id, cid).await },
+            move |res| {
+                let (Some(forward), Some(delete)) =
+                    (forward_weak.upgrade(), delete_weak.upgrade())
+                else {
+                    return;
+                };
+                // Bail if the menu was already dismissed (rows unparented).
+                if forward.parent().is_none() {
+                    return;
+                }
+                if let Ok(MessagePropsEnum::MessageProperties(p)) = res {
+                    forward.set_visible(p.can_be_forwarded);
+                    delete.set_visible(
+                        p.can_be_deleted_for_all_users || p.can_be_deleted_only_for_self,
+                    );
+                    // A hidden row shrank the card; re-clamp so it stays anchored.
+                    clamp2();
+                }
+            },
+        );
     }
 
     /// The message id of the row under (`x`,`y`) within the list view, if any.
@@ -2605,6 +2651,9 @@ impl ChatView {
         let this = self.clone();
         let vadj = self.inner.scroller.vadjustment();
         vadj.connect_value_changed(move |adj| {
+            if this.inner.suppress_paging.get() {
+                return;
+            }
             if adj.value() <= adj.page_size() * 0.5 {
                 this.load_older_history();
             }
