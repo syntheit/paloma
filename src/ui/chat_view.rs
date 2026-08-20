@@ -167,6 +167,13 @@ struct Inner {
     /// and on an outside click (see the outside-click gesture in
     /// `wire_row_menu`). Cleared in the popover's `connect_closed`.
     menu_popover: std::cell::RefCell<Option<gtk::Popover>>,
+    /// True for a brief window (~350ms) right after a context menu opens. On
+    /// touch, the long-press that opens the menu is the same continuous touch
+    /// sequence as the "tap", so the outside-click gesture would fire on that
+    /// very press (its point is on the message, outside the just-opened
+    /// popover) and dismiss the menu immediately. While set, the outside-click
+    /// gesture returns early so the opening touch can't close the menu.
+    menu_settle: std::cell::Cell<bool>,
 }
 
 impl ChatView {
@@ -489,6 +496,7 @@ impl ChatView {
             reaction_inflight: RefCell::new(HashSet::new()),
             suppress_paging: std::cell::Cell::new(false),
             menu_popover: std::cell::RefCell::new(None),
+            menu_settle: std::cell::Cell::new(false),
         });
 
         let this = ChatView {
@@ -2147,6 +2155,10 @@ impl ChatView {
         outside.set_propagation_phase(gtk::PropagationPhase::Capture);
         let this = self.clone();
         outside.connect_pressed(move |_gesture, _n, x, y| {
+            // Ignore the touch that just opened the menu (see `menu_settle`).
+            if this.inner.menu_settle.get() {
+                return;
+            }
             let Some(pop) = this.inner.menu_popover.borrow().clone() else {
                 return;
             };
@@ -2160,6 +2172,7 @@ impl ChatView {
                     return; // inside the menu: let the button handle it
                 }
             }
+            tracing::info!(x, y, "outside-click: dismissing menu");
             pop.popdown();
         });
         self.root.add_controller(outside);
@@ -2570,6 +2583,15 @@ impl ChatView {
         // Track the live menu so the outside-click / Escape / new-open paths can
         // dismiss it explicitly (autohide is off).
         *self.inner.menu_popover.borrow_mut() = Some(popover.clone());
+        // Guard the outside-click gesture from the touch that is opening this
+        // menu: on touch the long-press and its release are one continuous
+        // sequence, so that gesture would otherwise fire on the opening press
+        // and dismiss the menu instantly. Cleared shortly after.
+        self.inner.menu_settle.set(true);
+        let inner_settle = self.inner.clone();
+        glib::timeout_add_local_once(std::time::Duration::from_millis(350), move || {
+            inner_settle.menu_settle.set(false);
+        });
         let popover_for_show = popover.clone();
         glib::idle_add_local_once(move || {
             popover_for_show.popup();
