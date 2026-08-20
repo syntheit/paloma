@@ -240,9 +240,13 @@ const APP_CSS: &str = "
     padding: 4px 6px;
     min-width: 0;
 }
-/* Custom per-message context popover: reaction bar + action rows. */
-.msg-menu {
-    min-width: 180px;
+/* Anchored floating context menu (in the chat overlay): reaction bar + rows. */
+.msg-menu-card {
+    min-width: 200px;
+    padding: 6px;
+    border-radius: 12px;
+    background-color: @popover_bg_color;
+    box-shadow: 0 2px 12px 2px alpha(@shade_color, 0.5);
 }
 .msg-menu-item {
     padding: 8px 10px;

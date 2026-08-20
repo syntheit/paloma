@@ -119,6 +119,14 @@ struct Inner {
     /// value before awaiting and bails on resolve if it changed — so a stale
     /// `get_message_properties` result can't arm edit mode over a newer state.
     compose_gen: Cell<u64>,
+    /// The overlay wrapping the message `ScrolledWindow`. Same size as the chat
+    /// viewport and does NOT scroll — the host for the anchored context menu
+    /// (and the scroll-to-bottom button).
+    overlay: gtk::Overlay,
+    /// The currently-open anchored context menu, `(catcher, menu_box)`, or
+    /// `None`. Tracked so a new menu dismisses any prior one, and so dismissal
+    /// removes exactly the widgets that were added to the overlay.
+    open_menu: RefCell<Option<(gtk::Widget, gtk::Widget)>>,
     list_view: gtk::ListView,
     scroller: gtk::ScrolledWindow,
     entry: gtk::TextView,
@@ -460,6 +468,8 @@ impl ChatView {
             reply_to: Cell::new(0),
             editing: Cell::new(0),
             compose_gen: Cell::new(0),
+            overlay: overlay.clone(),
+            open_menu: RefCell::new(None),
             list_view,
             scroller,
             entry,
@@ -2209,37 +2219,89 @@ impl ChatView {
     }
 
     /// Identify the row under (`x`,`y`) inside the list view and present a
-    /// per-message context menu as an [`adw::Dialog`] — an adaptive bottom sheet
-    /// on mobile / floating dialog on desktop. The (`x`,`y`) are used only to
-    /// find the row; a dialog isn't anchored to a point.
+    /// per-message context menu ANCHORED at that point, with no dim.
     ///
-    /// A dialog (unlike a popover parented to the non-popover-host `ToolbarView`)
-    /// re-allocates correctly and manages its own dismissal — tap-outside, swipe
-    /// down, Escape, or the back button — so none of the old popover machinery
-    /// (autohide, outside-click gesture, Escape controller, deferred popup,
-    /// paging suppression) is needed. Every row is a plain `gtk::Button` whose
-    /// `connect_clicked` calls the target method directly then closes the dialog.
+    /// The menu is a plain floating `gtk::Box` (`.msg-menu-card`) added to the
+    /// chat's `gtk::Overlay` — not a popover (whose surface unmaps under the
+    /// non-popover-host `ToolbarView` on touch) and not a dialog (which dims the
+    /// whole screen behind a modal backdrop). A transparent full-area click
+    /// catcher sits behind the card so any tap outside it dismisses, without
+    /// darkening anything. Overlay margins place the card's top-left corner at
+    /// the tapped point, re-clamped once the card is mapped so it never spills
+    /// off the right/bottom edge. Only one menu is open at a time.
     fn popup_menu_at(&self, list_view: &gtk::Widget, x: f64, y: f64) {
         let message_id = match self.message_id_at(list_view, x, y) {
             Some(id) => id,
             None => return,
         };
 
+        let overlay = self.inner.overlay.clone();
+
+        // Only one menu at a time: tear down any menu already open before we
+        // build a new one (e.g. a second long-press without dismissing).
+        if let Some((catcher, menu_box)) = self.inner.open_menu.borrow_mut().take() {
+            overlay.remove_overlay(&catcher);
+            overlay.remove_overlay(&menu_box);
+        }
+
         // Common fast-react set, mirrored from the old picker. Tapping one
-        // toggles the current user's reaction and dismisses the dialog.
+        // toggles the current user's reaction and dismisses the menu.
         const PICKER_EMOJI: [&str; 7] = ["👍", "❤️", "🔥", "🎉", "😁", "😢", "🙏"];
 
-        let dialog = adw::Dialog::new();
-        dialog.set_content_width(360);
-
-        let container = gtk::Box::builder()
+        // The floating menu card: reaction bar on top, action rows below. Its
+        // top-left corner is positioned via overlay margins (halign/valign Start).
+        let menu_box = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
-            .css_classes(["msg-menu"])
-            .margin_top(12)
-            .margin_bottom(12)
-            .margin_start(12)
-            .margin_end(12)
+            .css_classes(["msg-menu-card"])
+            .halign(gtk::Align::Start)
+            .valign(gtk::Align::Start)
             .build();
+
+        // Transparent full-area catcher behind the card: a tap anywhere off the
+        // card dismisses the menu. Left fully transparent — no dim.
+        let catcher = gtk::Box::builder().hexpand(true).vexpand(true).build();
+
+        // Shared dismissal: remove BOTH overlay children and clear the tracked
+        // state. Guarded so the several dismissal paths (catcher tap, an action,
+        // an emoji, Escape) can't double-remove. Holds only local clones, which
+        // drop once the widgets leave the overlay — no permanent refs on Inner,
+        // so no reference cycle keeps the menu alive.
+        let dismiss: Rc<dyn Fn()> = {
+            let overlay = overlay.clone();
+            let catcher = catcher.clone();
+            let menu_box = menu_box.clone();
+            let inner = self.inner.clone();
+            Rc::new(move || {
+                if inner.open_menu.borrow_mut().take().is_some() {
+                    overlay.remove_overlay(&catcher);
+                    overlay.remove_overlay(&menu_box);
+                }
+            })
+        };
+
+        // Catcher tap (any button) dismisses.
+        let catch_click = gtk::GestureClick::new();
+        catch_click.set_button(0);
+        {
+            let dismiss = dismiss.clone();
+            catch_click.connect_pressed(move |_, _, _, _| dismiss());
+        }
+        catcher.add_controller(catch_click);
+
+        // Escape on the card dismisses.
+        let key = gtk::EventControllerKey::new();
+        {
+            let dismiss = dismiss.clone();
+            key.connect_key_pressed(move |_, keyval, _keycode, _state| {
+                if keyval == gtk::gdk::Key::Escape {
+                    dismiss();
+                    glib::Propagation::Stop
+                } else {
+                    glib::Propagation::Proceed
+                }
+            });
+        }
+        menu_box.add_controller(key);
 
         // --- Quick-reaction emoji bar (pill row on top) ---
         // Seeded synchronously with `PICKER_EMOJI`; the async fetch below swaps
@@ -2249,13 +2311,13 @@ impl ChatView {
             .spacing(2)
             .css_classes(["msg-reaction-picker"])
             .build();
-        container.append(&bar);
+        menu_box.append(&bar);
 
         // Append one flat emoji button to `bar` that toggles the reaction and
-        // closes the dialog. Shared by the sync fallback and the async swap.
+        // dismisses the menu. Shared by the sync fallback and the async swap.
         let add_pick = {
             let this = self.clone();
-            let dialog = dialog.clone();
+            let dismiss = dismiss.clone();
             let bar = bar.clone();
             move |emoji: String| {
                 let button = gtk::Button::builder()
@@ -2263,10 +2325,10 @@ impl ChatView {
                     .css_classes(["flat", "msg-reaction-pick"])
                     .build();
                 let this = this.clone();
-                let dialog = dialog.clone();
+                let dismiss = dismiss.clone();
                 button.connect_clicked(move |_| {
                     this.toggle_reaction(message_id, emoji.clone());
-                    dialog.close();
+                    dismiss();
                 });
                 bar.append(&button);
             }
@@ -2358,7 +2420,7 @@ impl ChatView {
 
         // --- Action rows below the bar ---
         // Each row is an icon + label inside a flat button; clicking invokes the
-        // target method directly then closes the dialog.
+        // target method directly then dismisses the menu.
         let make_item = |icon: &str, label: &str, destructive: bool| -> gtk::Button {
             let content = gtk::Box::builder()
                 .orientation(gtk::Orientation::Horizontal)
@@ -2382,13 +2444,13 @@ impl ChatView {
         let reply = make_item("mail-reply-sender-symbolic", "Reply", false);
         {
             let this = self.clone();
-            let dialog = dialog.clone();
+            let dismiss = dismiss.clone();
             reply.connect_clicked(move |_| {
                 this.start_reply(message_id);
-                dialog.close();
+                dismiss();
             });
         }
-        container.append(&reply);
+        menu_box.append(&reply);
 
         // Edit only applies to plain-text messages; `begin_edit` still confirms
         // `can_be_edited` asynchronously before arming the compose strip.
@@ -2402,49 +2464,90 @@ impl ChatView {
         if is_text {
             let edit = make_item("document-edit-symbolic", "Edit", false);
             let this = self.clone();
-            let dialog = dialog.clone();
+            let dismiss = dismiss.clone();
             edit.connect_clicked(move |_| {
                 this.begin_edit(message_id);
-                dialog.close();
+                dismiss();
             });
-            container.append(&edit);
+            menu_box.append(&edit);
         }
 
         let copy = make_item("edit-copy-symbolic", "Copy", false);
         {
             let this = self.clone();
-            let dialog = dialog.clone();
+            let dismiss = dismiss.clone();
             copy.connect_clicked(move |_| {
                 this.copy_message(message_id);
-                dialog.close();
+                dismiss();
             });
         }
-        container.append(&copy);
+        menu_box.append(&copy);
 
         let forward = make_item("mail-forward-symbolic", "Forward", false);
         {
             let this = self.clone();
-            let dialog = dialog.clone();
+            let dismiss = dismiss.clone();
             forward.connect_clicked(move |_| {
                 this.forward_message(message_id);
-                dialog.close();
+                dismiss();
             });
         }
-        container.append(&forward);
+        menu_box.append(&forward);
 
         let delete = make_item("user-trash-symbolic", "Delete", true);
         {
             let this = self.clone();
-            let dialog = dialog.clone();
+            let dismiss = dismiss.clone();
             delete.connect_clicked(move |_| {
                 this.delete_message(message_id);
-                dialog.close();
+                dismiss();
             });
         }
-        container.append(&delete);
+        menu_box.append(&delete);
 
-        dialog.set_child(Some(&container));
-        dialog.present(Some(&self.root));
+        // Add to the overlay: catcher first (behind), then the card (above it).
+        overlay.add_overlay(&catcher);
+        overlay.add_overlay(&menu_box);
+        *self.inner.open_menu.borrow_mut() = Some((
+            catcher.clone().upcast::<gtk::Widget>(),
+            menu_box.clone().upcast::<gtk::Widget>(),
+        ));
+
+        // Position the card's top-left at the tapped point, in overlay space.
+        let (tx, ty) = list_view
+            .translate_coordinates(&overlay, x, y)
+            .unwrap_or((x, y));
+        let tx = tx.max(0.0) as i32;
+        let ty = ty.max(0.0) as i32;
+        menu_box.set_margin_start(tx);
+        menu_box.set_margin_top(ty);
+
+        // Once mapped the card has a real allocation: re-clamp so it never
+        // spills off the right/bottom edge of the overlay. Runs on every map;
+        // cheap and idempotent.
+        {
+            let overlay = overlay.clone();
+            menu_box.connect_map(move |menu_box| {
+                let (menu_w, menu_h) = (menu_box.width(), menu_box.height());
+                let (ov_w, ov_h) = (overlay.width(), overlay.height());
+                let mut start = menu_box.margin_start();
+                let mut top = menu_box.margin_top();
+                if ov_w > 0 && start + menu_w > ov_w {
+                    start = ov_w - menu_w;
+                }
+                if ov_h > 0 && top + menu_h > ov_h {
+                    top = ov_h - menu_h;
+                }
+                let start = start.max(0);
+                let top = top.max(0);
+                if start != menu_box.margin_start() {
+                    menu_box.set_margin_start(start);
+                }
+                if top != menu_box.margin_top() {
+                    menu_box.set_margin_top(top);
+                }
+            });
+        }
     }
 
     /// The message id of the row under (`x`,`y`) within the list view, if any.
