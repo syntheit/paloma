@@ -2694,40 +2694,42 @@ impl ChatView {
     /// Scroll the history to the newest message.
     ///
     /// The message list is virtualized, so `vadj.upper()` (total content height)
-    /// is only an estimate until the bottom rows are realized/measured — a single
-    /// `set_value(upper)` undershoots. We set to the bottom now, then re-pin on
-    /// the next few `changed` (range) emissions as the height settles, then stop.
+    /// is only an estimate until the bottom rows are realized/measured, AND the
+    /// list may still be moving (residual kinetic/momentum scroll after a flick,
+    /// or a scroll slowly finishing). A single `set_value(upper)` both undershoots
+    /// the un-settled height and gets immediately overridden by the ongoing
+    /// momentum (which drives `value-changed`, not `changed`). So instead we pin
+    /// to the bottom every frame until the position has been stable at the bottom
+    /// for a few consecutive frames — i.e. momentum has decayed AND the
+    /// virtualized `upper` has stopped growing — with a safety cap.
     fn scroll_to_bottom(&self) {
         let vadj = self.inner.scroller.vadjustment();
         tracing::info!(upper = vadj.upper(), value = vadj.value(), "scroll_to_bottom");
-        vadj.set_value(vadj.upper());
-
-        // Initial idle set-to-upper (after the current layout pass).
-        {
-            let vadj = vadj.clone();
-            glib::idle_add_local_once(move || {
-                vadj.set_value(vadj.upper());
-            });
-        }
-
-        // Re-pin to the bottom as the adjustment's range settles. `changed`
-        // fires on RANGE (lower/upper/page-size) changes — i.e. as content is
-        // measured — NOT on user scroll (that's `value-changed`), so this won't
-        // fight a user scroll. Self-disconnects after a handful of updates.
-        let remaining = std::rc::Rc::new(std::cell::Cell::new(6u8));
-        let id_holder = std::rc::Rc::new(std::cell::RefCell::new(None));
-        let idh = id_holder.clone();
-        let rem = remaining.clone();
-        let id = vadj.connect_changed(move |a| {
-            a.set_value(a.upper());
-            rem.set(rem.get().saturating_sub(1));
-            if rem.get() == 0 {
-                if let Some(id) = idh.borrow_mut().take() {
-                    a.disconnect(id);
-                }
+        let stable = std::rc::Rc::new(std::cell::Cell::new(0u32));
+        let ticks = std::rc::Rc::new(std::cell::Cell::new(0u32));
+        glib::timeout_add_local(std::time::Duration::from_millis(16), move || {
+            // `upper - page_size` is the max scroll value (the true bottom).
+            let target = (vadj.upper() - vadj.page_size()).max(0.0);
+            // Was it already at the bottom BEFORE we force it? (i.e. has momentum
+            // settled and the height stopped growing?)
+            let at_bottom = (vadj.value() - target).abs() < 1.0;
+            // Force to the bottom (clamps internally to `target`).
+            vadj.set_value(vadj.upper());
+            if at_bottom {
+                stable.set(stable.get() + 1);
+            } else {
+                stable.set(0);
+            }
+            ticks.set(ticks.get() + 1);
+            // Stop once we've held the bottom for a few frames, or after a
+            // safety cap (~1.5s), so it never loops forever and releases
+            // control back to the user once genuinely at the bottom.
+            if stable.get() >= 4 || ticks.get() >= 90 {
+                glib::ControlFlow::Break
+            } else {
+                glib::ControlFlow::Continue
             }
         });
-        *id_holder.borrow_mut() = Some(id);
     }
 }
 
