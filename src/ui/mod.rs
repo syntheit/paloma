@@ -87,9 +87,14 @@ const APP_CSS: &str = "
     font-size: 1em;
 }
 .msg-entry-scroll {
+    background: transparent;
+    border-radius: 0;
+    padding: 0;
+}
+.msg-input-pill {
     border-radius: 18px;
     background-color: alpha(@card_fg_color, 0.08);
-    padding: 2px 4px;
+    padding: 0 4px;
 }
 
 /* --- Photo messages --- */

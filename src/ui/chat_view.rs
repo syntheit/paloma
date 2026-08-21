@@ -84,6 +84,10 @@ struct Inner {
     rec_timer_id: RefCell<Option<glib::SourceId>>,
     /// The normal compose row (entry + send/mic), hidden while recording.
     compose_row: gtk::Box,
+    /// Attachment button (left of the pill). Placeholder until attachments land.
+    attach_button: gtk::Button,
+    /// Sticker button (inside the pill, right side). Placeholder for now.
+    sticker_button: gtk::Button,
     /// The recording row (dot + timer + discard/send), shown while recording.
     recording_row: gtk::Box,
     /// Mic button in the compose row's trailing slot (shown when entry empty).
@@ -334,6 +338,9 @@ impl ChatView {
 
         let entry_scroll = gtk::ScrolledWindow::builder()
             .hscrollbar_policy(gtk::PolicyType::Never)
+            // Keep GTK's normal scrolling and touch-gesture behavior. The
+            // pill's bottom alignment below, not an external scrollbar,
+            // preserves the one-line resting height.
             .vscrollbar_policy(gtk::PolicyType::Automatic)
             .max_content_height(120)
             .propagate_natural_height(true)
@@ -342,8 +349,42 @@ impl ChatView {
             .build();
         entry_scroll.add_css_class("msg-entry-scroll");
 
+        // Attachment button on the LEFT, outside the pill, always visible.
+        // Placeholder until attachment support lands.
+        let attach_button = gtk::Button::builder()
+            .icon_name("mail-attachment-symbolic")
+            .valign(gtk::Align::End)
+            .css_classes(["circular", "flat", "msg-mic"])
+            .tooltip_text("Attach")
+            .build();
+
+        // Sticker button INSIDE the pill on the right, always visible.
+        // adwaita-49 has no `sticker-symbolic`, so use `face-smile-symbolic`.
+        // Placeholder until sticker support lands.
+        let sticker_button = gtk::Button::builder()
+            .icon_name("face-smile-symbolic")
+            .valign(gtk::Align::End)
+            .css_classes(["circular", "flat", "msg-mic"])
+            .tooltip_text("Stickers")
+            .build();
+
+        // Rounded pill wrapping the growing entry + the sticker button. The
+        // rounded-background visual lives on this box (`.msg-input-pill`); the
+        // inner scroll is transparent so only the outer pill shows its shape.
+        let input_pill = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .hexpand(true)
+            // The adjacent circular buttons have their own touch-target
+            // height. Keep the pill at the TextView's natural height instead
+            // of stretching it to that cross-axis allocation.
+            .valign(gtk::Align::End)
+            .build();
+        input_pill.add_css_class("msg-input-pill");
+        input_pill.append(&entry_scroll);
+        input_pill.append(&sticker_button);
+
         let send_button = gtk::Button::builder()
-            .icon_name("document-send-symbolic")
+            .icon_name("paloma-send-symbolic")
             .valign(gtk::Align::End)
             .css_classes(["circular", "suggested-action", "msg-send"])
             .tooltip_text("Send")
@@ -364,7 +405,8 @@ impl ChatView {
             .margin_start(8)
             .margin_end(8)
             .build();
-        compose_row.append(&entry_scroll);
+        compose_row.append(&attach_button);
+        compose_row.append(&input_pill);
         compose_row.append(&send_button);
         compose_row.append(&mic_button);
         send_button.set_visible(false);
@@ -389,7 +431,7 @@ impl ChatView {
             .tooltip_text("Discard")
             .build();
         let rec_send = gtk::Button::builder()
-            .icon_name("document-send-symbolic")
+            .icon_name("paloma-send-symbolic")
             .valign(gtk::Align::Center)
             .css_classes(["circular", "suggested-action"])
             .tooltip_text("Send voice message")
@@ -464,6 +506,8 @@ impl ChatView {
             recording: Cell::new(false),
             rec_timer_id: RefCell::new(None),
             compose_row: compose_row.clone(),
+            attach_button: attach_button.clone(),
+            sticker_button: sticker_button.clone(),
             recording_row: recording_row.clone(),
             mic_button: mic_button.clone(),
             send_button: send_button.clone(),
@@ -520,6 +564,19 @@ impl ChatView {
         {
             let this2 = this.clone();
             edit_cancel.connect_clicked(move |_| this2.cancel_edit());
+        }
+        // Placeholder click handlers until attachment / sticker support lands.
+        {
+            let this2 = this.clone();
+            this.inner.attach_button.connect_clicked(move |_| {
+                crate::ui::toast(&this2.inner.toasts, "Attachments coming soon");
+            });
+        }
+        {
+            let this2 = this.clone();
+            this.inner.sticker_button.connect_clicked(move |_| {
+                crate::ui::toast(&this2.inner.toasts, "Stickers coming soon");
+            });
         }
         this
     }
@@ -1395,21 +1452,13 @@ impl ChatView {
         key.connect_key_pressed(clone!(
             #[strong]
             this,
-            move |_, keyval, _keycode, state| {
+            move |_, keyval, _keycode, _state| {
                 // Escape cancels an in-progress edit before anything else.
                 if keyval == gtk::gdk::Key::Escape && this.inner.editing.get() != 0 {
                     this.cancel_edit();
                     return glib::Propagation::Stop;
                 }
-                let is_enter =
-                    keyval == gtk::gdk::Key::Return || keyval == gtk::gdk::Key::KP_Enter;
-                let shift = state.contains(gtk::gdk::ModifierType::SHIFT_MASK);
-                if is_enter && !shift {
-                    this.do_send();
-                    glib::Propagation::Stop
-                } else {
-                    glib::Propagation::Proceed
-                }
+                glib::Propagation::Proceed
             }
         ));
         self.inner.entry.add_controller(key);

@@ -132,6 +132,8 @@
                 $out/share/metainfo/io.matv.Paloma.metainfo.xml
               install -Dm644 data/icons/hicolor/scalable/apps/io.matv.Paloma.svg \
                 $out/share/icons/hicolor/scalable/apps/io.matv.Paloma.svg
+              install -Dm644 data/icons/hicolor/scalable/actions/paloma-send-symbolic.svg \
+                $out/share/icons/hicolor/scalable/actions/paloma-send-symbolic.svg
               install -Dm644 data/io.matv.Paloma.gschema.xml \
                 $out/share/glib-2.0/schemas/io.matv.Paloma.gschema.xml
               glib-compile-schemas $out/share/glib-2.0/schemas
