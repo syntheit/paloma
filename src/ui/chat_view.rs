@@ -338,10 +338,7 @@ impl ChatView {
 
         let entry_scroll = gtk::ScrolledWindow::builder()
             .hscrollbar_policy(gtk::PolicyType::Never)
-            // Keep GTK's normal scrolling and touch-gesture behavior. The
-            // pill's bottom alignment below, not an external scrollbar,
-            // preserves the one-line resting height.
-            .vscrollbar_policy(gtk::PolicyType::Automatic)
+            .vscrollbar_policy(gtk::PolicyType::External)
             .max_content_height(120)
             .propagate_natural_height(true)
             .hexpand(true)

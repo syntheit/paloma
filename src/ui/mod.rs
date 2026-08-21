@@ -86,6 +86,15 @@ const APP_CSS: &str = "
     background: transparent;
     font-size: 1em;
 }
+/* Hide GTK4's persistent touch insertion teardrop handle on the compose
+   entry — the on-screen keyboard commits via IM, so GTK never runs its
+   hide-on-keypress path and the handle sticks. Targets an internal GTK node
+   (cursor-handle); harmless no-op if the node name changes upstream. */
+cursor-handle.insertion-cursor {
+    opacity: 0;
+    min-width: 0;
+    min-height: 0;
+}
 .msg-entry-scroll {
     background: transparent;
     border-radius: 0;
